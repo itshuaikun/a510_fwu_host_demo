@@ -46,18 +46,6 @@ platform_i2c_driver_t i2c_driver = {
     .read = i2c_mem_read,
 };
 
-static inline uint8_t get_device_id(void) {
-    uint8_t device_id;
-    i2c_driver.read(I2C_ADDR, DEVICE_ID_ADDR, &device_id, 1);
-    return device_id;
-}
-
-static inline uint8_t get_boot_state(void) {
-    uint8_t boot_state;
-    i2c_driver.read(I2C_ADDR, BOOT_STATE_ADDR, &boot_state, 1);
-    return boot_state;
-}
-
 static inline bool is_fwu_ready(void) {
     uint8_t status;
     i2c_driver.read(I2C_ADDR, FWU_STATUS_ADDR, &status, 1);
@@ -119,12 +107,10 @@ int main(int argc, char **argv)
     send_fwu_cmd(FWU_CMD_REQUEST);
     usleep(20000);
 
-    if (argc == 3) {
-        printf("     BL => FWU_SRAM... ");
-        RETUEN0_OR_DIE(send_file(argv[2], true), "Failed to send file: %s\n", argv[2]);
-        send_fwu_cmd(FWU_CMD_FILE_SEND_DONE);
-        usleep(10000);
-    }
+    printf("     BL => FWU_SRAM... ");
+    RETUEN0_OR_DIE(send_file((argc == 3) ? argv[2] : ".default_fwu_sram", true), "Failed to send fwu_sram\n");
+    send_fwu_cmd(FWU_CMD_FILE_SEND_DONE);
+    usleep(10000);
 
     printf("     programming... ");
     RETUEN0_OR_DIE(send_file(argv[1], true), "Failed to send file: %s\n", argv[1]);
