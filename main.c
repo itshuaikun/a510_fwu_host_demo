@@ -6,9 +6,17 @@
 #include <assert.h>
 #include <unistd.h>
 
-#define RETUEN0_OR_DIE(expr, fmt, ...) do { \
-    if ((expr) != 0) { \
-        fprintf(stderr, fmt, ##__VA_ARGS__); \
+// Byte swap macros (MCU data is little-endian)
+#define SWAP16(x) ((uint16_t)(((x) >> 8) | ((x) << 8)))
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    #define LE16_TO_HOST(x) (x)
+#else
+    #define LE16_TO_HOST(x) SWAP16(x)
+#endif
+
+#define ASSERT_FATAL(expr, fmt, ...) do { \
+    if (!(expr)) { \
+        fprintf(stderr, "%s:%d: " fmt "\n", __FILE__, __LINE__, ##__VA_ARGS__); \
         exit(EXIT_FAILURE); \
     } \
 } while(0)
@@ -52,6 +60,20 @@ static inline bool is_fwu_ready(void) {
     return status == 0x00;
 }
 
+static uint16_t fwu_fifo_length = 0;
+static uint8_t* fwu_fifo_buf = NULL;
+static inline void update_fwu_fifo_length(void) {
+    union {
+        uint8_t length8[2];
+        uint16_t length16;
+    } length;
+    ASSERT_FATAL(i2c_driver.read(I2C_ADDR, FWU_FIFO_LENGTH_ADDR, length.length8, 2) == 0, "Failed to read FWU_FIFO_LENGTH");
+    ASSERT_FATAL(length.length16 > 0, "FWU_FIFO_LENGTH is 0");
+    fwu_fifo_length = LE16_TO_HOST(length.length16);
+    fwu_fifo_buf = (uint8_t*)malloc(fwu_fifo_length);
+    ASSERT_FATAL(fwu_fifo_buf != NULL, "Buy more RAM!");
+}
+
 static int send_file(const char *filename, bool show_progress) {
     FILE *fp = fopen(filename, "rb");
     if (fp == NULL) {
@@ -62,14 +84,13 @@ static int send_file(const char *filename, bool show_progress) {
     size_t file_size = ftell(fp);
     fseek(fp, 0, SEEK_SET);
 
-    unsigned char data[128];
     size_t offset = 0;
     int last_percent = -1;
     while (offset < file_size) {
-        size_t to_read = (file_size - offset > 128) ? 128 : file_size - offset;
-        fread(data, 1, to_read, fp);
+        size_t to_read = (file_size - offset > fwu_fifo_length) ? fwu_fifo_length : file_size - offset;
+        fread(fwu_fifo_buf, 1, to_read, fp);
         while (!is_fwu_ready());
-        i2c_driver.write(I2C_ADDR, FWU_FIFO_ADDR, data, to_read);
+        i2c_driver.write(I2C_ADDR, FWU_FIFO_ADDR, fwu_fifo_buf, to_read);
         offset += to_read;
         if (show_progress) {
             int percent = (int)(offset * 100 / file_size);
@@ -87,7 +108,7 @@ static int send_file(const char *filename, bool show_progress) {
 }
 
 static inline void send_fwu_cmd(uint8_t cmd) {
-    RETUEN0_OR_DIE(i2c_driver.write(I2C_ADDR, FWU_CONTROL_ADDR, (uint8_t[]){cmd}, 1), "Failed to send command");
+    ASSERT_FATAL(i2c_driver.write(I2C_ADDR, FWU_CONTROL_ADDR, (uint8_t[]){cmd}, 1) == 0, "Failed to send command");
 }
 
 int main(int argc, char **argv)
@@ -102,21 +123,23 @@ int main(int argc, char **argv)
         exit(EXIT_FAILURE);
     }
 
-    RETUEN0_OR_DIE(i2c_driver.init(), "Failed to initialize I2C driver");
+    ASSERT_FATAL(i2c_driver.init() == 0, "Failed to initialize I2C driver");
 
     send_fwu_cmd(FWU_CMD_REQUEST);
     usleep(20000);
+    update_fwu_fifo_length();
 
     printf("     BL => FWU_SRAM... ");
-    RETUEN0_OR_DIE(send_file((argc == 3) ? argv[2] : ".default_fwu_sram", true), "Failed to send fwu_sram\n");
+    ASSERT_FATAL(send_file((argc == 3) ? argv[2] : ".default_fwu_sram", true) == 0, "Failed to send fwu_sram");
     send_fwu_cmd(FWU_CMD_FILE_SEND_DONE);
     usleep(10000);
 
     printf("     programming... ");
-    RETUEN0_OR_DIE(send_file(argv[1], true), "Failed to send file: %s\n", argv[1]);
+    ASSERT_FATAL(send_file(argv[1], true) == 0, "Failed to send file: %s", argv[1]);
     
     send_fwu_cmd(FWU_CMD_REBOOT);
 
-    RETUEN0_OR_DIE(i2c_driver.deinit(), "Failed to deinitialize I2C driver");
+    ASSERT_FATAL(i2c_driver.deinit() == 0, "Failed to deinitialize I2C driver");
+    free(fwu_fifo_buf);
     return 0;
 }
