@@ -1,0 +1,357 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <stddef.h>
+#include <getopt.h>
+#include <dirent.h>
+#include "ch34x_lib.h"
+
+// 声明为extern，不再重复定义
+extern int dev_fd;
+
+// 定义最大数据缓冲区大小 (1MB)
+#define MAX_DATA_SIZE (1024 * 1024)
+#define MAX_DEVICES 10
+
+// 扫描可用的 CH34x 设备，返回设备数量，devices[] 存储设备索引
+static int scan_ch34x_devices(int devices[], int max_count) {
+    DIR *dir;
+    struct dirent *entry;
+    int count = 0;
+
+    dir = opendir("/dev");
+    if (!dir) {
+        return 0;
+    }
+
+    while ((entry = readdir(dir)) != NULL && count < max_count) {
+        if (strncmp(entry->d_name, "ch34x_pis", 9) == 0) {
+            int index = entry->d_name[9] - '0';
+            if (index >= 0 && index <= 9) {
+                devices[count++] = index;
+            }
+        }
+    }
+
+    closedir(dir);
+    return count;
+}
+
+// 自动选择设备，返回设备索引，失败返回 -1
+static int auto_select_device(int specified_index) {
+int devices[MAX_DEVICES];
+int count = scan_ch34x_devices(devices, MAX_DEVICES);
+
+if (count == 0) {
+    fprintf(stderr, "错误: 未找到 CH34x 设备\n");
+    return -1;
+}
+
+// 如果用户指定了索引
+if (specified_index >= 0) {
+    for (int i = 0; i < count; i++) {
+        if (devices[i] == specified_index) {
+            return specified_index;
+        }
+    }
+    fprintf(stderr, "错误: 指定的设备 /dev/ch34x_pis%d 不存在\n", specified_index);
+    fprintf(stderr, "可用设备: ");
+    for (int i = 0; i < count; i++) {
+        fprintf(stderr, "/dev/ch34x_pis%d ", devices[i]);
+    }
+    fprintf(stderr, "\n");
+    return -1;
+}
+
+// 只有一个设备，自动选择
+if (count == 1) {
+    return devices[0];
+}
+
+// 多个设备，需要用户指定
+fprintf(stderr, "错误: 发现 %d 个 CH34x 设备，请使用 -i 参数指定:\n", count);
+for (int i = 0; i < count; i++) {
+    fprintf(stderr, "  /dev/ch34x_pis%d\n", devices[i]);
+}
+return -1;
+}
+
+// 命令行选项
+typedef struct {
+    int operation;      // 0:读, 1:写
+    int device_addr;    // 设备地址
+    int reg_addr;       // 寄存器地址
+    size_t length;      // 读取/写入长度
+    int clock_speed;    // I2C时钟速度 (0-3)
+    int dev_index;      // CH34x 设备索引 (-1 表示自动选择)
+    unsigned char data[MAX_DATA_SIZE]; // 写入数据缓冲区
+    int verbose;        // 详细输出
+    char *input_file;   // 输入文件路径
+} cmd_options_t;
+
+// 从文件读取数据，返回读取字节数，失败返回 0
+size_t load_file_data(const char *filepath, unsigned char *buffer, size_t max_size) {
+FILE *fp = fopen(filepath, "rb");
+if (!fp) {
+    fprintf(stderr, "错误: 无法打开文件 %s\n", filepath);
+    return 0;
+}
+
+size_t count = fread(buffer, 1, max_size, fp);
+fclose(fp);
+
+if (count == 0) {
+    fprintf(stderr, "错误: 文件为空或读取失败\n");
+}
+
+return count;
+}
+
+// 显示使用帮助
+void show_help(char *progname) {
+    printf("用法: %s [选项]\n", progname);
+    printf("选项:\n");
+    printf("  -r          读操作\n");
+    printf("  -w          写操作\n");
+    printf("  -d ADDR     设备地址 (十六进制, 例如: 0x50)\n");
+    printf("  -a ADDR     寄存器地址 (十六进制, 例如: 0x00)\n");
+    printf("  -l LEN      读取长度 (十进制, 默认: 1)\n");
+    printf("  -s SPEED    I2C时钟 (0:20k, 1:100k, 2:400k, 3:750k)\n");
+    printf("  -i NUM      CH34x设备索引 (默认: 自动)\n");
+    printf("  -v DATA     十六进制数据 (例如: 0x11,0x22)\n");
+    printf("  -t TEXT     文本字符串 (例如: \"hello world\")\n");
+    printf("  -f FILE     从文件读取数据\n");
+    printf("  -V          详细输出\n");
+    printf("  -h          显示帮助\n");
+    printf("\n示例:\n");
+    printf("  %s -r -d 0x50 -a 0x00 -l 8\n", progname);
+    printf("  %s -w -d 0x50 -a 0x00 -v 0x11,0x22\n", progname);
+    printf("  %s -w -d 0x50 -a 0x00 -t \"hello\"\n", progname);
+    printf("  %s -w -d 0x50 -a 0x00 -f data.bin\n", progname);
+}
+
+// 解析命令行参数
+int parse_options(int argc, char **argv, cmd_options_t *options) {
+    int c;
+    char *data_str = NULL;
+    char *token;
+    size_t count = 0;
+    
+    // 设置默认值
+    options->operation = -1;
+    options->device_addr = -1;
+    options->reg_addr = -1;
+    options->length = 1;
+    options->clock_speed = 1; // 默认100kHz
+    options->dev_index = -1;  // -1 表示自动选择
+    options->verbose = 0;
+    options->input_file = NULL;
+    
+    while ((c = getopt(argc, argv, "rwd:a:l:s:i:v:t:f:Vh")) != -1) {
+        switch (c) {
+            case 'r':
+                options->operation = 0;
+                break;
+                
+            case 'w':
+                options->operation = 1;
+                break;
+                
+            case 'd':
+                options->device_addr = (int)strtol(optarg, NULL, 0);
+                break;
+                
+            case 'a':
+                options->reg_addr = (int)strtol(optarg, NULL, 0);
+                break;
+                
+            case 'l':
+                options->length = (size_t)strtoul(optarg, NULL, 0);
+                if (options->length > MAX_DATA_SIZE) {
+                    fprintf(stderr, "错误: 长度超过最大值 %zu\n", (size_t)MAX_DATA_SIZE);
+                    return -1;
+                }
+                break;
+                
+            case 's':
+                options->clock_speed = (int)strtol(optarg, NULL, 0);
+                if (options->clock_speed < 0 || options->clock_speed > 3) {
+                    fprintf(stderr, "错误: 时钟速度必须在0-3范围内\n");
+                    return -1;
+                }
+                break;
+            
+            case 'i':
+                options->dev_index = (int)strtol(optarg, NULL, 0);
+                break;
+                
+            case 'v':
+                data_str = strdup(optarg);
+                token = strtok(data_str, ",");
+                while (token != NULL && count < MAX_DATA_SIZE) {
+                    options->data[count++] = (unsigned char)strtol(token, NULL, 0);
+                    token = strtok(NULL, ",");
+                }
+                options->length = count;
+                free(data_str);
+                break;
+            
+            case 't':
+                // 文本字符串直接复制为数据
+                count = strlen(optarg);
+                if (count > MAX_DATA_SIZE) count = MAX_DATA_SIZE;
+                memcpy(options->data, optarg, count);
+                options->length = count;
+                break;
+            
+            case 'f':
+                options->input_file = optarg;
+                break;
+                
+            case 'V':
+                options->verbose = 1;
+                break;
+                
+            case 'h':
+                show_help(argv[0]);
+                return -2;
+                
+            case '?':
+                return -1;
+                
+            default:
+                abort();
+        }
+    }
+    
+    // 验证必要参数
+    if (options->operation == -1) {
+        fprintf(stderr, "错误: 必须指定操作类型 (-r 或 -w)\n");
+        return -1;
+    }
+    
+    if (options->device_addr == -1) {
+        fprintf(stderr, "错误: 必须指定设备地址 (-d)\n");
+        return -1;
+    }
+    
+    if (options->reg_addr == -1) {
+        fprintf(stderr, "错误: 必须指定寄存器地址 (-a)\n");
+        return -1;
+    }
+    
+    // 如果指定了文件，从文件加载数据
+    if (options->input_file) {
+        size_t len = load_file_data(options->input_file, options->data, MAX_DATA_SIZE);
+        if (len == 0) return -1;
+        options->length = len;
+    }
+    
+    return 0;
+}
+
+// 初始化CH341A设备
+int init_device()
+{
+    int dev_index = -1;
+    int clock_speed = 1;
+    // 自动选择或验证设备
+    int selected = auto_select_device(dev_index);
+    if (selected < 0) {
+        return -1;
+    }
+
+    // 打开设备
+    dev_fd = CH34xOpenDevice(selected);
+    if (dev_fd <= 0) {
+        fprintf(stderr, "打开CH341A设备失败\n");
+        return -1;
+    }
+    
+    // 获取设备版本信息
+    PUCHAR VendorId = (PUCHAR)malloc(sizeof(long));
+    if (!CH34x_GetVendorId(VendorId)) {
+        fprintf(stderr, "获取设备信息失败\n");
+        CH34xCloseDevice();
+        return -1;
+    }
+    
+    // 设置I2C模式和速度
+    // 正确设置值为:
+    // 0x00: 20kHz (默认)
+    // 0x01: 100kHz
+    // 0x02: 400kHz
+    // 0x03: 750kHz
+    if (!CH34xSetStream(clock_speed)) {
+        fprintf(stderr, "设置I2C模式失败\n");
+        CH34xCloseDevice();
+        return -1;
+    }
+    
+    return 0;
+}
+
+int deinit_device()
+{
+    CH34xCloseDevice();
+    return 0;
+}
+
+// 单次传输最大字节数 (CH341A 硬件限制约 4KB，保守使用 1KB)
+#define I2C_CHUNK_SIZE 1000
+
+// 写入I2C内存数据 (支持大文件分块传输)
+int i2c_mem_write(unsigned char addr, unsigned char reg, unsigned char* data, size_t len)
+{
+    unsigned char buffer[I2C_CHUNK_SIZE + 2];
+    size_t offset = 0;
+    size_t chunk_num = 0;
+    
+    while (offset < len) {
+        size_t chunk_len = (len - offset > I2C_CHUNK_SIZE) ? I2C_CHUNK_SIZE : (len - offset);
+        unsigned long write_len = chunk_len + 2;
+        
+        // 第一个字节是设备地址(写模式)
+        buffer[0] = addr << 1;  // 7位地址左移1位，最低位为0表示写
+        
+        // 第二个字节是寄存器地址 (FIFO模式：始终使用同一地址)
+        buffer[1] = reg;
+        
+        // 复制数据块
+        memcpy(&buffer[2], data + offset, chunk_len);
+        
+        // 使用CH34xStreamI2C发送数据
+        if (!CH34xStreamI2C(write_len, buffer, 0, NULL)) {
+            fprintf(stderr, "I2C写入失败 (块 %zu, 偏移 %zu)\n", chunk_num, offset);
+            return -1;
+        }
+        
+        // 等待设备处理 (给MCU足够时间处理FIFO数据)
+    //  CH34xSetDelaymS(50);
+        
+        offset += chunk_len;
+        chunk_num++;
+    }
+    
+    return 0;
+}
+
+// 读取I2C内存数据
+int i2c_mem_read(unsigned char addr, unsigned char reg, unsigned char* data, size_t len)
+{
+    unsigned char write_buf[2];
+    
+    // 首先发送设备地址和寄存器地址
+    write_buf[0] = addr << 1;  // 7位地址左移1位，最低位为0表示写
+    write_buf[1] = reg;
+    
+    // 读取数据
+    // 发送寄存器地址，然后再进行读取操作
+    if (!CH34xStreamI2C(2, write_buf, len, data)) {
+        fprintf(stderr, "I2C读取失败\n");
+        return -1;
+    }
+    
+    return 0;
+}

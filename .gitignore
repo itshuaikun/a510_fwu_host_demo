@@ -1,0 +1,7 @@
+.cache/
+.vscode/
+.cursor/
+.cursorignore
+build/
+compile_commands.json
+.clangd
