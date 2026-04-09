@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <assert.h>
+#include <string.h>
 #include <unistd.h>
 
 // Byte swap macros (MCU data is little-endian)
@@ -89,8 +90,12 @@ static int send_file(const char *filename, bool show_progress) {
     while (offset < file_size) {
         size_t to_read = (file_size - offset > fwu_fifo_length) ? fwu_fifo_length : file_size - offset;
         fread(fwu_fifo_buf, 1, to_read, fp);
-        while (!is_fwu_ready());
-        i2c_driver.write(I2C_ADDR, FWU_FIFO_ADDR, fwu_fifo_buf, to_read);
+        while (!is_fwu_ready()) {
+        }
+        if (i2c_driver.write(I2C_ADDR, FWU_FIFO_ADDR, fwu_fifo_buf, to_read) != 0) {
+            fclose(fp);
+            return -1;
+        }
         offset += to_read;
         if (show_progress) {
             int percent = (int)(offset * 100 / file_size);
@@ -111,6 +116,11 @@ static inline void send_fwu_cmd(uint8_t cmd) {
     ASSERT_FATAL(i2c_driver.write(I2C_ADDR, FWU_CONTROL_ADDR, (uint8_t[]){cmd}, 1) == 0, "Failed to send command");
 }
 
+static void print_usage(const char *prog)
+{
+    fprintf(stderr, "Usage: %s <app.bin> [fwu_sram.bin]\n", prog);
+}
+
 int main(int argc, char **argv)
 {
     assert(&i2c_driver != NULL);
@@ -118,8 +128,12 @@ int main(int argc, char **argv)
     assert(i2c_driver.deinit != NULL);
     assert(i2c_driver.write != NULL);
     assert(i2c_driver.read != NULL);
+    if (argc == 2 && (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0)) {
+        print_usage(argv[0]);
+        return 0;
+    }
     if (argc < 2 || argc > 3) {
-        fprintf(stderr, "Usage: %s <app.bin> [fwu_sram.bin]\n", argv[0]);
+        print_usage(argv[0]);
         exit(EXIT_FAILURE);
     }
 
