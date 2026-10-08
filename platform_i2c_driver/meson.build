@@ -1,8 +1,8 @@
-lib_platform_i2c_driver = static_library('platform_i2c_driver',
-    sources: ['i2c_mem_rw.c'],
-)
+backend = get_option('i2c_backend')
+
+subdir(backend)
 
 platform_i2c_driver_dep = declare_dependency(
-    link_with: lib_platform_i2c_driver,
+    link_with: backend_lib,
     include_directories: include_directories('.'),
 )

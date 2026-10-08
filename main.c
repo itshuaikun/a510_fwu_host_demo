@@ -3,7 +3,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
-#include <assert.h>
+#include <errno.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -37,30 +37,32 @@
 #define FWU_CMD_RESEND 0x02
 #define FWU_CMD_FILE_SEND_DONE 0x03
 
-// 7bit device address, 8bit register address, 8bit data unit
-// return 0: success, other: error
-typedef struct {
-    int (*init)();
-    int (*deinit)();
-    int (*write)(unsigned char dev_addr, unsigned char reg_addr, unsigned char* data, size_t len);
-    int (*read)(unsigned char dev_addr, unsigned char reg_addr, unsigned char* data, size_t len);
-} platform_i2c_driver_t;
-
-// platform_i2c_driver
-#include "i2c_mem_rw.h"
-platform_i2c_driver_t i2c_driver = {
-    .init = init_device,
-    .deinit = deinit_device,
-    .write = i2c_mem_write,
-    .read = i2c_mem_read,
-};
+#include "platform_i2c_driver.h"
 
 static inline bool is_fwu_ready(void) {
-    uint8_t status;
-    i2c_driver.read(I2C_ADDR, FWU_STATUS_ADDR, &status, 1);
+    uint8_t status = 0xFF;
+    if (platform_i2c_driver.read(I2C_ADDR, FWU_STATUS_ADDR, &status, 1) != 0) {
+        return false;
+    }
     return status == 0x00;
 }
 
+#define FWU_WAIT_TIMEOUT_US (5 * 1000 * 1000)
+
+static inline void wait_fwu_ready(const char *what) {
+    int64_t waited_us = 0;
+    while (!is_fwu_ready()) {
+        usleep(1000);
+        waited_us += 1000;
+        ASSERT_FATAL(waited_us < FWU_WAIT_TIMEOUT_US,
+                     "Timeout waiting for FWU FIFO to drain (%s)", what);
+    }
+}
+
+// FWU_CONTROL REQUEST resets the MCU and the bootloader takes a while to
+// bring its I2C slave up, so poll until FWU_FIFO_LENGTH reads back a usable
+// value (in APP state that register reads 0, in BL/FWU_SRAM it is the FIFO
+// capacity). A fixed sleep here is not enough on real hardware.
 static uint16_t fwu_fifo_length = 0;
 static uint8_t* fwu_fifo_buf = NULL;
 static inline void update_fwu_fifo_length(void) {
@@ -68,9 +70,20 @@ static inline void update_fwu_fifo_length(void) {
         uint8_t length8[2];
         uint16_t length16;
     } length;
-    ASSERT_FATAL(i2c_driver.read(I2C_ADDR, FWU_FIFO_LENGTH_ADDR, length.length8, 2) == 0, "Failed to read FWU_FIFO_LENGTH");
-    ASSERT_FATAL(length.length16 > 0, "FWU_FIFO_LENGTH is 0");
-    fwu_fifo_length = LE16_TO_HOST(length.length16);
+    int64_t waited_us = 0;
+    // The MCU is off the bus while it resets, so a NACK here is the expected
+    // answer: the retry itself is the progress report, no need to log it.
+    while (true) {
+        if (platform_i2c_driver.read(I2C_ADDR, FWU_FIFO_LENGTH_ADDR, length.length8, 2) == 0 &&
+            length.length16 != 0) {
+            fwu_fifo_length = LE16_TO_HOST(length.length16);
+            break;
+        }
+        usleep(5000);
+        waited_us += 5000;
+        ASSERT_FATAL(waited_us < FWU_WAIT_TIMEOUT_US,
+                     "Timeout waiting for FWU bootloader FIFO");
+    }
     fwu_fifo_buf = (uint8_t*)malloc(fwu_fifo_length);
     ASSERT_FATAL(fwu_fifo_buf != NULL, "Buy more RAM!");
 }
@@ -89,10 +102,16 @@ static int send_file(const char *filename, bool show_progress) {
     int last_percent = -1;
     while (offset < file_size) {
         size_t to_read = (file_size - offset > fwu_fifo_length) ? fwu_fifo_length : file_size - offset;
-        fread(fwu_fifo_buf, 1, to_read, fp);
-        while (!is_fwu_ready()) {
+        if (fread(fwu_fifo_buf, 1, to_read, fp) != to_read) {
+            fprintf(stderr, "Failed to read %zu bytes at offset %zu from %s\n",
+                    to_read, offset, filename);
+            fclose(fp);
+            return -1;
         }
-        if (i2c_driver.write(I2C_ADDR, FWU_FIFO_ADDR, fwu_fifo_buf, to_read) != 0) {
+        wait_fwu_ready("before FIFO write");
+        if (platform_i2c_driver.write(I2C_ADDR, FWU_FIFO_ADDR, fwu_fifo_buf, to_read) != 0) {
+            fprintf(stderr, "I2C write failed: reg=0x%02x offset=%zu len=%zu: %s\n",
+                    FWU_FIFO_ADDR, offset, to_read, strerror(errno));
             fclose(fp);
             return -1;
         }
@@ -108,43 +127,38 @@ static int send_file(const char *filename, bool show_progress) {
     }
     if (show_progress) printf("\n");
     fclose(fp);
-    while (!is_fwu_ready()); // make sure sent data is processed
+    wait_fwu_ready("final drain"); // make sure sent data is processed
     return 0;
 }
 
 static inline void send_fwu_cmd(uint8_t cmd) {
-    ASSERT_FATAL(i2c_driver.write(I2C_ADDR, FWU_CONTROL_ADDR, (uint8_t[]){cmd}, 1) == 0, "Failed to send command");
+    ASSERT_FATAL(platform_i2c_driver.write(I2C_ADDR, FWU_CONTROL_ADDR, (uint8_t[]){cmd}, 1) == 0,
+                 "Failed to send command 0x%02X: %s", cmd, strerror(errno));
 }
 
 static void print_usage(const char *prog)
 {
-    fprintf(stderr, "Usage: %s <app.bin> [fwu_sram.bin]\n", prog);
+    fprintf(stderr, "Usage: %s <app.bin> <fwu_sram.bin>\n", prog);
 }
 
 int main(int argc, char **argv)
 {
-    assert(&i2c_driver != NULL);
-    assert(i2c_driver.init != NULL);
-    assert(i2c_driver.deinit != NULL);
-    assert(i2c_driver.write != NULL);
-    assert(i2c_driver.read != NULL);
     if (argc == 2 && (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0)) {
         print_usage(argv[0]);
         return 0;
     }
-    if (argc < 2 || argc > 3) {
+    if (argc != 3) {
         print_usage(argv[0]);
         exit(EXIT_FAILURE);
     }
 
-    ASSERT_FATAL(i2c_driver.init() == 0, "Failed to initialize I2C driver");
+    ASSERT_FATAL(platform_i2c_driver.init() == 0, "Failed to initialize I2C driver");
 
     send_fwu_cmd(FWU_CMD_REQUEST);
-    usleep(20000);
     update_fwu_fifo_length();
 
     printf("     BL => FWU_SRAM... ");
-    ASSERT_FATAL(send_file((argc == 3) ? argv[2] : ".default_fwu_sram", true) == 0, "Failed to send fwu_sram");
+    ASSERT_FATAL(send_file(argv[2], true) == 0, "Failed to send fwu_sram");
     send_fwu_cmd(FWU_CMD_FILE_SEND_DONE);
     usleep(10000);
 
@@ -153,7 +167,7 @@ int main(int argc, char **argv)
     
     send_fwu_cmd(FWU_CMD_REBOOT);
 
-    ASSERT_FATAL(i2c_driver.deinit() == 0, "Failed to deinitialize I2C driver");
+    ASSERT_FATAL(platform_i2c_driver.deinit() == 0, "Failed to deinitialize I2C driver");
     free(fwu_fifo_buf);
     return 0;
 }

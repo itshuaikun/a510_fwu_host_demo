@@ -5,3 +5,10 @@
 build/
 compile_commands.json
 .clangd
+
+# built by the tools themselves: meson builds into build/, the test harnesses
+# rebuild these two in the repo root
+/fwu_host_demo
+/mcu_status
+fwu_stress_results/
+fwu_fault_results/

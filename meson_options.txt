@@ -1,0 +1,5 @@
+option('i2c_backend',
+    type: 'combo',
+    choices: ['ch347', 'smbus'],
+    value: 'ch347',
+    description: 'Which platform_i2c_driver backend to build: ch347 talks raw I2C (I2C_RDWR) through the ch34x_mphsi_master adapter, smbus talks I2C-block SMBus (I2C_SMBUS) through a PCH SMBus controller.')
