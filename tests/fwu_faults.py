@@ -5,11 +5,17 @@ Every case breaks the update on purpose and then requires a plain re-run of the
 host tool to restore the board: a release blocker is any case that leaves the
 MCU in a state a normal FWU cannot recover from.
 
+Cases that hand the tool a bad image no longer reach the MCU at all: the host
+pre-check rejects them offline (exit 2) and the board keeps running the firmware
+it had. Recovery from a half-written image is still covered by the kill@NN%
+cases, which kill the tool mid-transfer of a valid image.
+
     tests/fwu_faults.py <app.bin> <fwu_sram.bin> [results_dir]
 
 Env:
     BACKEND=smbus|ch347   backend to build/run (default smbus)
     A510_OLD_APP=...      optional second app image to test a real content swap
+                          (must be a current, version 2 image for this board)
     A510_BDF=05:00.0      optional PCIe BDF, recorded as an AER delta per case
 
 Outputs <results_dir>/faults.csv and one log per case.
@@ -37,7 +43,7 @@ def build():
     src = os.path.join(ROOT, "platform_i2c_driver", BACKEND, "platform_i2c_driver.c")
     if not os.path.exists(src):
         sys.exit("no such backend: %s" % src)
-    for out, args in (("fwu_host_demo", ["main.c"]),
+    for out, args in (("fwu_host_demo", ["main.c", "image.c"]),
                       ("mcu_status", [os.path.join("tests", "mcu_status.c")])):
         r = sh(["gcc", "-O2", "-o", out] + args + [src, "-Iplatform_i2c_driver"], cwd=ROOT)
         if r.returncode != 0:
@@ -126,6 +132,14 @@ def main():
     tool, status_exe = build()
     old_app = os.environ.get("A510_OLD_APP")
 
+    def must_refuse(name, args):
+        """The pre-check must reject this offline: exit 2 and no I2C traffic."""
+        r = sh(["timeout", "180", tool] + args, cwd=ROOT)
+        if r.returncode != 2:
+            sys.exit("%s: expected the image pre-check to refuse (exit 2), got %d\n%s%s"
+                     % (name, r.returncode, r.stdout, r.stderr))
+        return r.returncode
+
     # prepared bad images
     data = open(os.path.join(ROOT, app), "rb").read()
     trunc = os.path.join(results, "app_truncated.bin")
@@ -139,10 +153,12 @@ def main():
         ("kill@10%", lambda: kill_at_percent(tool, app, sram, 10), "MCU away from APP, recoverable"),
         ("kill@50%", lambda: kill_at_percent(tool, app, sram, 50), "MCU away from APP, recoverable"),
         ("kill@90%", lambda: kill_at_percent(tool, app, sram, 90), "MCU away from APP, recoverable"),
-        ("truncated app", lambda: sh(["timeout", "180", tool, trunc, sram], cwd=ROOT).returncode,
-         "bootloader rejects CRC, recoverable"),
-        ("corrupt app payload", lambda: sh(["timeout", "180", tool, badcrc, sram], cwd=ROOT).returncode,
-         "bootloader rejects CRC, recoverable"),
+        ("truncated app", lambda: must_refuse("truncated app", [trunc, sram]),
+         "host pre-check refuses, board untouched"),
+        ("corrupt app payload", lambda: must_refuse("corrupt app payload", [badcrc, sram]),
+         "host pre-check refuses, board untouched"),
+        ("swapped images", lambda: must_refuse("swapped images", [sram, app]),
+         "host pre-check refuses, board untouched"),
         ("no args", lambda: sh([tool], cwd=ROOT).returncode, "usage error, board untouched"),
         ("one arg", lambda: sh([tool, app], cwd=ROOT).returncode, "usage error, board untouched"),
         ("wrong bus", lambda: sh(["env", "A510_I2C_BUS=5", tool, app, sram], cwd=ROOT).returncode,
@@ -172,8 +188,10 @@ def main():
             "case": name, "expected": expect,
             "state_after_fault": after_fault.get("boot_state", "?"),
             "app_after_fault": after_fault.get("app", "?"),
+            "board_id_after_fault": after_fault.get("board_id", "?"),
             "recovery_rc": rc, "recovery_s": "%.1f" % dur,
             "recovery_app": st.get("app", "?"), "recovery_hash": st.get("git_hash", "?"),
+            "recovery_board_id": st.get("board_id", "?"),
             "result": "RECOVERED" if ok else "BRICKED",
             "note": note,
         })

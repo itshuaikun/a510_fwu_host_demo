@@ -8,7 +8,7 @@
 #include "platform_i2c_driver.h"
 
 #define MCU_ADDR 0x12
-#define MAP_SIZE 0x52
+#define MAP_SIZE 0x54
 
 static void kv_u8(const char *key, const unsigned char *m, int reg)
 {
@@ -37,6 +37,10 @@ int main(void)
     kv_u8("boot_state", m, 0x01);
     printf("app=%d\n", m[0x01] == 0x01);
     kv_u16("version", m, 0x02);
+    /* 0x52 is the BOARD_ID register the FWU host compares its images against;
+     * firmware older than memmap version 0x0201 has no descriptor there and
+     * reads back 0x0000. */
+    kv_u16("board_id", m, 0x52);
     kv_u16("total_power", m, 0x04);
     kv_u16("junction_temp", m, 0x06);
     kv_u8("alert_status", m, 0x2C);

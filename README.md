@@ -50,6 +50,77 @@ receives without validating it, so it has to match the board being updated.
 ./build/fwu_host_demo app.bin fwu_sram_bin/d1_c2_fwu_sram.bin
 ```
 
+There is no flag that skips the checks: the tool validates, flashes, and reports
+errors, nothing else.
+
+## Pre-check
+
+Both files are checked **before the first I2C access**, and the board is asked
+which board it is **before it is reset into the bootloader**. A rejected file or
+a wrong board therefore leaves the MCU running what it already has.
+
+Exit codes:
+
+| Code | Meaning |
+| ---- | ------- |
+| 0 | Update finished (`-h`/`--help` also exits 0) |
+| 1 | Usage, I2C/device failure, or MCU firmware too old for this image |
+| 2 | **Image rejected** (including an unreadable file); the MCU was never touched |
+
+What is checked, per file: readable regular file; magic `0x9CA3`; header version
+2; `image_size == file size - 36`; CRC32 of everything after the header (the same
+zlib/IEEE CRC the firmware computes); the image fits its region (992KB flash or
+250KB SRAM); `vector_addr` is exactly the 512-byte-aligned vector table at the
+region base + `0x200` and lies inside the image; the initial stack pointer is in
+SRAM and the reset vector has its Thumb bit set and points into the image. The
+two arguments are also role-checked, so `app.bin` and `fwu_sram.bin` swapped by
+mistake is refused instead of flashed.
+
+Then, with the MCU on the bus:
+
+* `VERSION` (memmap version, `0x02`) must be `>= 0x0201`. Older firmware computes
+  its CRC from offset 24 and would reject every version 2 image, so the tool
+  refuses and tells you to flash `build/<board>/flash.bin` over SWD once.
+* `BOARD_ID` (`0x52`) must match the `board_id` of **both** images
+  (`1=D1_EVB`, `2=D1_C2`, `3=D2_EVB`, `4=D2_OAM`). A version 2 image for another
+  board still passes magic/version/CRC, so this is the check that stops it. The
+  `fwu_sram` image is compared too, not just `app.bin`: the bootloader jumps into
+  it without validating it, and the four `fwu_sram` builds differ only in their
+  header, the build timestamp, and the board id they report while running — so
+  today any of them would work, and checking both is what keeps that from being
+  an assumption the tool silently relies on.
+
+Offline regression (no MCU needed, ~28 cases including CRC-consistent semantic
+mutants):
+
+```bash
+python3 tests/image_precheck.py [--app <app.bin>] [--sram <fwu_sram.bin>]
+```
+
+## Side effects on the host
+
+`FWU_CMD_REQUEST` resets the MCU, and the MCU owns the A510's power and reset
+lines, so every update also resets the card. The host sees the device leave the
+PCIe link and logs AER entries: a 10-iteration soak produced one
+`severity=Uncorrected (Fatal)` entry per iteration, and the link re-trained at
+2.5GT/s (its capability is 16GT/s). Update when the device is idle, and pass
+`A510_BDF=<bdf>` to `tests/fwu_stress.sh` to record the link speed and the error
+counter around every iteration instead of finding out later.
+
+## Interrupting
+
+`Ctrl-C` (SIGINT) and a dropped terminal (SIGHUP) are ignored from the moment the
+application image starts programming until the MCU has been asked to reboot. The
+MCU is rewriting the only application slot during that window, so stopping there
+would leave a half-written image that will not boot (recoverable, but only by
+re-running a full update). The first `Ctrl-C` prints a one-line notice explaining
+that it was ignored, so nobody reaches for the power switch instead.
+
+Everything else is not held off: SIGTERM and SIGKILL still stop the tool (a
+supervisor needs that, and `tests/fwu_faults.py` SIGKILLs the tool on purpose to
+test exactly that half-written state), and interrupting the earlier
+`BL => FWU_SRAM` phase stays harmless because it only writes SRAM.
+
 ## Portability
 
 Runtime dependencies are just libc and the kernel's `i2c-dev` (plus an adapter
@@ -82,5 +153,9 @@ sideband), and `/dev/i2c-*` is root-only by default.
 
 `fwu_sram_bin/` ships the FWU_SRAM image of every board variant
 (`d1_evb`, `d1_c2`, `d2_evb`, `d2_oam`); regenerate them with the matching
-`fwu_sram` target of the A510 MCU firmware build.
+`fwu_sram` target of the A510 MCU firmware build. Each one carries the board
+identity in its header, so they must be rebuilt whenever the firmware tree moves:
+an image older than the rest of the tree still passes the format checks but its
+`git_sha` will differ from the `app.bin` you flash alongside it (the tool prints a
+note, it does not refuse).
 

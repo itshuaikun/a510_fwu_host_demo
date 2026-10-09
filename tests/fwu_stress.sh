@@ -41,7 +41,7 @@ SRC="platform_i2c_driver/$BACKEND/platform_i2c_driver.c"
 [ -f "$SRC" ] || { echo "no such backend: $SRC" >&2; exit 2; }
 
 echo "== building ($BACKEND backend) =="
-gcc -O2 -o fwu_host_demo main.c "$SRC" -Iplatform_i2c_driver || exit 2
+gcc -O2 -o fwu_host_demo main.c image.c "$SRC" -Iplatform_i2c_driver || exit 2
 gcc -O2 -o mcu_status tests/mcu_status.c "$SRC" -Iplatform_i2c_driver || exit 2
 
 mkdir -p "$RESULTS"
