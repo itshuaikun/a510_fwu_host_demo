@@ -67,7 +67,9 @@
 /* REQUEST waits until the running slot has confirmed itself (up to 30 s after
  * the MCU started) and then erases the whole target slot. */
 #define REQUEST_TIMEOUT_MS 120000
-#define DRAIN_TIMEOUT_MS 5000
+/* A chunk normally programs in a few ms, but the D1 main loop has been seen
+ * to stall for 1-4 s while FWU data is programmed (D1 C2, 0ec8a51). */
+#define DRAIN_TIMEOUT_MS 30000
 #define VERIFY_TIMEOUT_MS 30000
 #define ACTIVATE_TIMEOUT_MS 30000
 
