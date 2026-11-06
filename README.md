@@ -40,86 +40,77 @@ and corrupt the stream. Either backend auto-detects the bus by reading
 
 ## Usage
 
-Both images are required: the bootloader jumps to whatever `fwu_sram.bin` it
-receives without validating it, so it has to match the board being updated.
+Requires MCU firmware with memmap `VERSION >= 0x0300` (A/B slot FWU, see
+`a510_mcu/doc/interface/host_fwu_guide.md`). The firmware is linked once per
+flash slot, so pass both builds of the same commit; the tool sends the one the
+MCU asks for (`FWU_SLOT`).
 
 ```bash
-./build/fwu_host_demo <app.bin> <fwu_sram.bin>
+./build/fwu_host_demo <slot_a.bin> <slot_b.bin>
 
-# e.g. a D1 C2 board
-./build/fwu_host_demo app.bin fwu_sram_bin/d1_c2_fwu_sram.bin
+# e.g. a D2 OAM board, from the a510_mcu build tree
+./build/fwu_host_demo ../a510_mcu/build/d2_oam/app/app.bin ../a510_mcu/build/d2_oam/app_b/app.bin
 ```
 
-There is no flag that skips the checks: the tool validates, flashes, and reports
-errors, nothing else.
+What happens:
+
+1. `REQUEST`: the running APP erases its **inactive** slot in the background. It
+   first waits until the running slot has confirmed itself (30 s after the MCU
+   started), so this step can take up to ~40 s.
+2. The image is streamed through `FWU_FIFO` and written to the inactive slot
+   while the APP keeps running (power, protection, PERST follow).
+3. `FILE_SEND_DONE`: the MCU checks header, CRC, board and link address; `READY`.
+4. `ACTIVATE`: warm switch to the new slot. The MCU is not reset, so the A510
+   stays powered and its PCIe link stays up. The tool waits until the APP
+   reports the new slot.
+
+The new slot is on trial for 30 s: a crash or reset before that rolls back to
+the previous slot. Firmware older than `0x0300` uses a different flash layout:
+flash `a510_mcu build/<board>/flash.bin` over SWD once.
+
+If no slot is valid the MCU waits in the bootloader (`BOOT_STATE=0`,
+`FWU_SLOT=0xF0`); the same command restores slot A (that path resets the MCU).
 
 ## Pre-check
 
 Both files are checked **before the first I2C access**, and the board is asked
-which board it is **before it is reset into the bootloader**. A rejected file or
-a wrong board therefore leaves the MCU running what it already has.
+which board it is before anything is written. A rejected file or a wrong board
+therefore leaves the MCU running what it already has.
 
 Exit codes:
 
 | Code | Meaning |
 | ---- | ------- |
-| 0 | Update finished (`-h`/`--help` also exits 0) |
-| 1 | Usage, I2C/device failure, or MCU firmware too old for this image |
+| 0 | Update finished and the new slot is running (`-h`/`--help` also exits 0) |
+| 1 | Usage, I2C/device failure, MCU firmware too old, or the MCU refused the image |
 | 2 | **Image rejected** (including an unreadable file); the MCU was never touched |
 
-What is checked, per file: readable regular file; magic `0x9CA3`; header version
-2; `image_size == file size - 36`; CRC32 of everything after the header (the same
-zlib/IEEE CRC the firmware computes); the image fits its region (992KB flash or
-250KB SRAM); `vector_addr` is exactly the 512-byte-aligned vector table at the
-region base + `0x200` and lies inside the image; the initial stack pointer is in
-SRAM and the reset vector has its Thumb bit set and points into the image. The
-two arguments are also role-checked, so `app.bin` and `fwu_sram.bin` swapped by
-mistake is refused instead of flashed.
+Per file: readable regular file; magic `0x9CA3`; header version 2;
+`image_size == file size - 36`; CRC32 of everything after the header; the image
+fits a slot (448KB - 16B); `vector_addr` is exactly the slot base + `0x200`
+(slot A `0x08010000`, slot B `0x08090000`), so swapped files are refused; the
+initial stack pointer is in SRAM and the reset vector has its Thumb bit set and
+points into the image. Both files must name the same board, and that board must
+match the MCU's `BOARD_ID` (`0x52`).
 
-Then, with the MCU on the bus:
-
-* `VERSION` (memmap version, `0x02`) must be `>= 0x0201`. Older firmware computes
-  its CRC from offset 24 and would reject every version 2 image, so the tool
-  refuses and tells you to flash `build/<board>/flash.bin` over SWD once.
-* `BOARD_ID` (`0x52`) must match the `board_id` of **both** images
-  (`1=D1_EVB`, `2=D1_C2`, `3=D2_EVB`, `4=D2_OAM`). A version 2 image for another
-  board still passes magic/version/CRC, so this is the check that stops it. The
-  `fwu_sram` image is compared too, not just `app.bin`: the bootloader jumps into
-  it without validating it, and the four `fwu_sram` builds differ only in their
-  header, the build timestamp, and the board id they report while running — so
-  today any of them would work, and checking both is what keeps that from being
-  an assumption the tool silently relies on.
-
-Offline regression (no MCU needed, ~28 cases including CRC-consistent semantic
-mutants):
+Offline regression (no MCU needed):
 
 ```bash
-python3 tests/image_precheck.py [--app <app.bin>] [--sram <fwu_sram.bin>]
+python3 tests/image_precheck.py [--build ../a510_mcu/build/<board>]
 ```
 
 ## Side effects on the host
 
-`FWU_CMD_REQUEST` resets the MCU, and the MCU owns the A510's power and reset
-lines, so every update also resets the card. The host sees the device leave the
-PCIe link and logs AER entries: a 10-iteration soak produced one
-`severity=Uncorrected (Fatal)` entry per iteration, and the link re-trained at
-2.5GT/s (its capability is 16GT/s). Update when the device is idle, and pass
-`A510_BDF=<bdf>` to `tests/fwu_stress.sh` to record the link speed and the error
-counter around every iteration instead of finding out later.
+None by design: the update never resets the MCU, so the A510 and its PCIe link
+stay up. `tests/fwu_stress.sh` with `A510_BDF=<bdf>` treats any PCIe error,
+link-speed change or a slot that did not switch as a failure; consecutive
+iterations alternate slots and each waits for the previous one to confirm.
 
 ## Interrupting
 
-`Ctrl-C` (SIGINT) and a dropped terminal (SIGHUP) are ignored from the moment the
-application image starts programming until the MCU has been asked to reboot. The
-MCU is rewriting the only application slot during that window, so stopping there
-would leave a half-written image that will not boot (recoverable, but only by
-re-running a full update). The first `Ctrl-C` prints a one-line notice explaining
-that it was ignored, so nobody reaches for the power switch instead.
-
-Everything else is not held off: SIGTERM and SIGKILL still stop the tool (a
-supervisor needs that, and `tests/fwu_faults.py` SIGKILLs the tool on purpose to
-test exactly that half-written state), and interrupting the earlier
-`BL => FWU_SRAM` phase stays harmless because it only writes SRAM.
+Safe at any point: until `ACTIVATE` only the inactive slot is written, and the
+running firmware is untouched. Re-run the tool to finish the update
+(`tests/fwu_faults.py` kills it mid-write on purpose and checks exactly that).
 
 ## Portability
 
@@ -150,12 +141,3 @@ docker run --rm -v "$PWD:/w" -w /w ubuntu:22.04 bash -c \
 Also required per host: the MCU's SMBus has to be routed to the PCH (the
 `smbus` backend only answers on boards whose PCIe slot carries the SMBus
 sideband), and `/dev/i2c-*` is root-only by default.
-
-`fwu_sram_bin/` ships the FWU_SRAM image of every board variant
-(`d1_evb`, `d1_c2`, `d2_evb`, `d2_oam`); regenerate them with the matching
-`fwu_sram` target of the A510 MCU firmware build. Each one carries the board
-identity in its header, so they must be rebuilt whenever the firmware tree moves:
-an image older than the rest of the tree still passes the format checks but its
-`git_sha` will differ from the `app.bin` you flash alongside it (the tool prints a
-note, it does not refuse).
-

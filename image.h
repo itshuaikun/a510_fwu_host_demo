@@ -27,15 +27,13 @@ typedef enum {
 } image_board_t;
 
 /*
- * Which slot a file is being flashed into. The two images are not
- * interchangeable: the bootloader copies the fwu_sram image into SRAM and jumps
- * straight to the vector table it finds there without validating anything, so
- * handing it the app image (or the other way round) hangs the board instead of
- * failing safely.
+ * Which A/B flash slot a file is linked for. The firmware is linked twice, once
+ * per slot, and the MCU only accepts the image linked for the slot it writes
+ * (it reports that slot in FWU_SLOT), so the two files are not interchangeable.
  */
 typedef enum {
-    IMAGE_ROLE_APP = 0,  /* FWU_SRAM programs it at 0x08008000 in flash */
-    IMAGE_ROLE_FWU_SRAM, /* the bootloader copies it to 0x20001800 in SRAM */
+    IMAGE_ROLE_SLOT_A = 0, /* linked at 0x08010000 (build/<board>/app/app.bin) */
+    IMAGE_ROLE_SLOT_B,     /* linked at 0x08090000 (build/<board>/app_b/app.bin) */
 } image_role_t;
 
 typedef struct {
@@ -57,7 +55,7 @@ typedef struct {
     char board_name[IMAGE_BOARD_NAME_LEN + 1];
 } image_info_t;
 
-/* The flash/SRAM window an image of this role must live in. */
+/* The flash slot an image of this role must live in. */
 const image_region_t *image_role_region(image_role_t role);
 
 /* Canonical name of a board_id, or NULL when it is not a board identity. */

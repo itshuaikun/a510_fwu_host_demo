@@ -5,17 +5,16 @@ Every case breaks the update on purpose and then requires a plain re-run of the
 host tool to restore the board: a release blocker is any case that leaves the
 MCU in a state a normal FWU cannot recover from.
 
-Cases that hand the tool a bad image no longer reach the MCU at all: the host
-pre-check rejects them offline (exit 2) and the board keeps running the firmware
-it had. Recovery from a half-written image is still covered by the kill@NN%
-cases, which kill the tool mid-transfer of a valid image.
+Cases that hand the tool a bad image never reach the MCU: the host pre-check
+rejects them offline (exit 2). The kill@NN% cases kill the tool mid-transfer of
+a valid image: with the A/B protocol only the inactive slot is half written, so
+the MCU must stay in the APP on the same slot, with no PCIe error, and a plain
+re-run must finish the update.
 
-    tests/fwu_faults.py <app.bin> <fwu_sram.bin> [results_dir]
+    tests/fwu_faults.py <slot_a.bin> <slot_b.bin> [results_dir]
 
 Env:
     BACKEND=smbus|ch347   backend to build/run (default smbus)
-    A510_OLD_APP=...      optional second app image to test a real content swap
-                          (must be a current, version 2 image for this board)
     A510_BDF=05:00.0      optional PCIe BDF, recorded as an AER delta per case
 
 Outputs <results_dir>/faults.csv and one log per case.
@@ -54,8 +53,8 @@ def build():
 def mcu_status(exe, tries=12, delay=0.5):
     """Read the MCU state, retrying while the slave is still off the bus.
 
-    Right after a REBOOT the MCU is resetting and briefly does not answer, so a
-    single read would look like a dead board.
+    Right after an ACTIVATE the MCU is switching slots and briefly does not
+    answer, so a single read would look like a dead board.
     """
     r = None
     for _ in range(tries):
@@ -83,15 +82,15 @@ def aer_count():
         return None
 
 
-def fwu(tool, app, sram, timeout=180):
+def fwu(tool, slot_a, slot_b, timeout=180):
     t0 = time.time()
-    r = sh(["timeout", str(timeout), tool, app, sram], cwd=ROOT)
+    r = sh(["timeout", str(timeout), tool, slot_a, slot_b], cwd=ROOT)
     return r.returncode, time.time() - t0, r.stdout + r.stderr
 
 
-def kill_at_percent(tool, app, sram, pct):
-    """Run an update and SIGKILL the tool once the app phase reaches pct%."""
-    p = subprocess.Popen([tool, app, sram], cwd=ROOT, bufsize=0,
+def kill_at_percent(tool, slot_a, slot_b, pct):
+    """Run an update and SIGKILL the tool once the write phase reaches pct%."""
+    p = subprocess.Popen([tool, slot_a, slot_b], cwd=ROOT, bufsize=0,
                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     in_app_phase = False
     buf = b""
@@ -103,7 +102,7 @@ def kill_at_percent(tool, app, sram, pct):
         if ch in (b"\r", b"\n"):
             line = buf.decode(errors="replace")
             buf = b""
-            if "programming" in line:
+            if "writing" in line:
                 in_app_phase = True
             m = re.search(r"(\d+)%", line)
             if in_app_phase and m and int(m.group(1)) >= pct:
@@ -116,8 +115,8 @@ def kill_at_percent(tool, app, sram, pct):
     return killed
 
 
-def recover(tool, status_exe, app, sram):
-    rc, dur, out = fwu(tool, app, sram)
+def recover(tool, status_exe, slot_a, slot_b):
+    rc, dur, out = fwu(tool, slot_a, slot_b)
     st = mcu_status(status_exe)
     ok = rc == 0 and st.get("app") == "1"
     return ok, rc, dur, st, out
@@ -126,11 +125,10 @@ def recover(tool, status_exe, app, sram):
 def main():
     if len(sys.argv) < 3:
         sys.exit(__doc__)
-    app, sram = sys.argv[1], sys.argv[2]
+    slot_a, slot_b = sys.argv[1], sys.argv[2]
     results = sys.argv[3] if len(sys.argv) > 3 else "fwu_fault_results"
     os.makedirs(results, exist_ok=True)
     tool, status_exe = build()
-    old_app = os.environ.get("A510_OLD_APP")
 
     def must_refuse(name, args):
         """The pre-check must reject this offline: exit 2 and no I2C traffic."""
@@ -141,7 +139,7 @@ def main():
         return r.returncode
 
     # prepared bad images
-    data = open(os.path.join(ROOT, app), "rb").read()
+    data = open(os.path.join(ROOT, slot_a), "rb").read()
     trunc = os.path.join(results, "app_truncated.bin")
     open(trunc, "wb").write(data[: len(data) // 2])
     bad = bytearray(data)
@@ -150,23 +148,20 @@ def main():
     open(badcrc, "wb").write(bytes(bad))
 
     cases = [
-        ("kill@10%", lambda: kill_at_percent(tool, app, sram, 10), "MCU away from APP, recoverable"),
-        ("kill@50%", lambda: kill_at_percent(tool, app, sram, 50), "MCU away from APP, recoverable"),
-        ("kill@90%", lambda: kill_at_percent(tool, app, sram, 90), "MCU away from APP, recoverable"),
-        ("truncated app", lambda: must_refuse("truncated app", [trunc, sram]),
+        ("kill@10%", lambda: kill_at_percent(tool, slot_a, slot_b, 10), "MCU stays in APP on the same slot"),
+        ("kill@50%", lambda: kill_at_percent(tool, slot_a, slot_b, 50), "MCU stays in APP on the same slot"),
+        ("kill@90%", lambda: kill_at_percent(tool, slot_a, slot_b, 90), "MCU stays in APP on the same slot"),
+        ("truncated slot A", lambda: must_refuse("truncated slot A", [trunc, slot_b]),
          "host pre-check refuses, board untouched"),
-        ("corrupt app payload", lambda: must_refuse("corrupt app payload", [badcrc, sram]),
+        ("corrupt slot A payload", lambda: must_refuse("corrupt slot A payload", [badcrc, slot_b]),
          "host pre-check refuses, board untouched"),
-        ("swapped images", lambda: must_refuse("swapped images", [sram, app]),
+        ("swapped slots", lambda: must_refuse("swapped slots", [slot_b, slot_a]),
          "host pre-check refuses, board untouched"),
         ("no args", lambda: sh([tool], cwd=ROOT).returncode, "usage error, board untouched"),
-        ("one arg", lambda: sh([tool, app], cwd=ROOT).returncode, "usage error, board untouched"),
-        ("wrong bus", lambda: sh(["env", "A510_I2C_BUS=5", tool, app, sram], cwd=ROOT).returncode,
+        ("one arg", lambda: sh([tool, slot_a], cwd=ROOT).returncode, "usage error, board untouched"),
+        ("wrong bus", lambda: sh(["env", "A510_I2C_BUS=5", tool, slot_a, slot_b], cwd=ROOT).returncode,
          "init fails, board untouched"),
     ]
-    if old_app:
-        cases.append(("swap to a different app", lambda: sh(["timeout", "180", tool, old_app, sram], cwd=ROOT).returncode,
-                      "board boots the other image, then restored"))
 
     rows = []
     for name, action, expect in cases:
@@ -179,18 +174,23 @@ def main():
         with open(log, "w") as f:
             f.write("before=%s\nafter_fault=%s\naction_result=%s\n" % (before, after_fault, out))
 
-        ok, rc, dur, st, rec_out = recover(tool, status_exe, app, sram)
+        ok, rc, dur, st, rec_out = recover(tool, status_exe, slot_a, slot_b)
         aer1 = aer_count()
         note = ""
+        # The fault itself must never take the board away: same slot, still APP.
+        if after_fault.get("slot_a") != "1" or after_fault.get("running_slot") != before.get("running_slot"):
+            ok = False
+            note = "fault disturbed the running firmware"
         if aer0 is not None and aer1 is not None and aer1 > aer0:
-            note = "PCIe errors +%d" % (aer1 - aer0)
+            ok = False
+            note = (note + "; " if note else "") + "PCIe errors +%d" % (aer1 - aer0)
         rows.append({
             "case": name, "expected": expect,
             "state_after_fault": after_fault.get("boot_state", "?"),
-            "app_after_fault": after_fault.get("app", "?"),
+            "app_after_fault": after_fault.get("slot_a", "?"),
             "board_id_after_fault": after_fault.get("board_id", "?"),
             "recovery_rc": rc, "recovery_s": "%.1f" % dur,
-            "recovery_app": st.get("app", "?"), "recovery_hash": st.get("git_hash", "?"),
+            "recovery_app": st.get("slot_a", "?"), "recovery_hash": st.get("git_hash", "?"),
             "recovery_board_id": st.get("board_id", "?"),
             "result": "RECOVERED" if ok else "BRICKED",
             "note": note,

@@ -12,3 +12,4 @@ compile_commands.json
 /mcu_status
 fwu_stress_results/
 fwu_fault_results/
+__pycache__/

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline regression for the app.bin / fwu_sram.bin pre-check. No MCU needed.
+"""Offline regression for the slot A / slot B image pre-check. No MCU needed.
 
 The tool is always run with A510_I2C_BUS pointing at a bus that cannot exist, so
 any run that reaches the driver fails with exit 1. That makes the exit codes
@@ -15,10 +15,10 @@ vector table, bad stack pointer or reset vector) keep the header self-consistent
 by recomputing image_size and CRC32, so they exercise the checks that sit behind
 the CRC instead of stopping at it.
 
-    tests/image_precheck.py [--app <app.bin>] [--sram <fwu_sram.bin>]
+    tests/image_precheck.py [--build <a510_mcu/build/<board>>]
 
-Without --app it looks for ../a510_mcu/build/*/app/app.bin and skips the cases
-that need a real app image when none is found.
+Without --build it uses the first ../a510_mcu/build/<board> holding both
+app/app.bin (slot A) and app_b/app.bin (slot B).
 Env: BACKEND=smbus|ch347 (default smbus).
 Exit: 0 every case behaved as expected, 1 otherwise.
 """
@@ -37,10 +37,9 @@ BACKEND = os.environ.get("BACKEND", "smbus")
 
 HEADER = 36
 VECTOR_OFF = 0x200
-APP_BASE = 0x08008000
-APP_SIZE = 992 * 1024
-SRAM_BASE = 0x20001800
-SRAM_SIZE = 250 * 1024
+SLOT_A = 0x08010000
+SLOT_B = 0x08090000
+SLOT_SIZE = 448 * 1024 - 16
 BOARDS = {1: "D1_EVB", 2: "D1_C2", 3: "D2_EVB", 4: "D2_OAM"}
 
 # A bus number that cannot exist, so a run that gets past the pre-check fails in
@@ -98,8 +97,8 @@ def mutated(base, fn, seal_it=False):
     return seal(bytes(b)) if seal_it else bytes(b)
 
 
-def app_cases(app):
-    """(name, bytes) mutants for the app.bin position."""
+def slot_a_cases(app):
+    """(name, bytes) mutants for the slot A position."""
     cases = []
 
     def add(name, fn, seal_it=False):
@@ -113,156 +112,127 @@ def app_cases(app):
     add("unknown board id", lambda b: struct.pack_into("<L", b, 24, 99), True)
     add("board id 0", lambda b: struct.pack_into("<L", b, 24, 0), True)
     add("board name mismatch", lambda b: b.__setitem__(slice(28, 36), b"ZZZZZZZ\x00"), True)
-    add("vector unaligned", lambda b: struct.pack_into("<L", b, 12, APP_BASE + VECTOR_OFF + 1), True)
-    add("vector out of any window", lambda b: struct.pack_into("<L", b, 12, 0x08000200), True)
-    add("vector in the SRAM window", lambda b: struct.pack_into("<L", b, 12, SRAM_BASE + VECTOR_OFF), True)
-    add("vector at the wrong app offset", lambda b: struct.pack_into("<L", b, 12, APP_BASE + 0x400), True)
+    add("vector unaligned", lambda b: struct.pack_into("<L", b, 12, SLOT_A + VECTOR_OFF + 1), True)
+    add("vector in the old app window", lambda b: struct.pack_into("<L", b, 12, 0x08008200), True)
+    add("vector in the slot B window", lambda b: struct.pack_into("<L", b, 12, SLOT_B + VECTOR_OFF), True)
+    add("vector at the wrong slot offset", lambda b: struct.pack_into("<L", b, 12, SLOT_A + 0x400), True)
     add("stack pointer outside SRAM", lambda b: struct.pack_into("<L", b, VECTOR_OFF, 0x12345678), True)
+    add("stack pointer past 192KB SRAM", lambda b: struct.pack_into("<L", b, VECTOR_OFF, 0x20038000), True)
     add("reset vector without Thumb bit",
         lambda b: struct.pack_into("<L", b, VECTOR_OFF + 4,
                                    struct.unpack_from("<L", b, VECTOR_OFF + 4)[0] & ~1), True)
     add("reset vector outside the image",
-        lambda b: struct.pack_into("<L", b, VECTOR_OFF + 4, APP_BASE + APP_SIZE - 3), True)
+        lambda b: struct.pack_into("<L", b, VECTOR_OFF + 4, SLOT_A + SLOT_SIZE - 3), True)
 
     cases.append(("truncated in half", app[: len(app) // 2]))
     cases.append(("trailing bytes", app + b"\x00" * 4096))
     cases.append(("payload shrunk under the minimum", seal(app[: HEADER + 256])))
+    cases.append(("larger than a slot", seal(app + b"\xff" * SLOT_SIZE)))
     cases.append(("tiny file", b"\x01\x02\x03"))
     cases.append(("ascii junk", b"not an A510 image, just some text.\n" * 8))
     return cases
 
 
-def sram_cases(sram):
+def slot_b_cases(img):
     return [
-        ("sram: bad magic", mutated(sram, lambda b: b.__setitem__(slice(0, 2), b"\x00\x00"))),
-        ("sram: payload bit flip", mutated(sram, lambda b: b.__setitem__(len(b) - 1, b[-1] ^ 0xFF))),
-        ("sram: vector in the app window",
-         mutated(sram, lambda b: struct.pack_into("<L", b, 12, APP_BASE + VECTOR_OFF), True)),
+        ("slot B: bad magic", mutated(img, lambda b: b.__setitem__(slice(0, 2), b"\x00\x00"))),
+        ("slot B: payload bit flip", mutated(img, lambda b: b.__setitem__(len(b) - 1, b[-1] ^ 0xFF))),
+        ("slot B: vector in the slot A window",
+         mutated(img, lambda b: struct.pack_into("<L", b, 12, SLOT_A + VECTOR_OFF), True)),
     ]
 
 
-def shipped_sram(board_id=None):
-    """Shipped fwu_sram_bin/ images, optionally only those of one board."""
-    out = []
-    for path in sorted(glob.glob(os.path.join(ROOT, "fwu_sram_bin", "*_fwu_sram.bin"))):
-        with open(path, "rb") as f:
-            if board_id is None or fields(f.read())["board_id"] == board_id:
-                out.append(path)
-    return out
+def other_board(img):
+    """The same image re-labelled for another board, header kept consistent."""
+    f = fields(img)
+    bid = 1 if f["board_id"] != 1 else 2
+
+    def relabel(b):
+        struct.pack_into("<L", b, 24, bid)
+        b[28:36] = BOARDS[bid].encode().ljust(8, b"\0")
+    return mutated(img, relabel, True)
+
+
+def tmpfile(blob):
+    with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as f:
+        f.write(blob)
+        return f.name
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--app", help="a real app.bin from the firmware build (version 2)")
-    ap.add_argument("--sram", help="a real fwu_sram.bin (default: the shipped one for the app's board)")
+    ap.add_argument("--build", help="a510_mcu build/<board> directory with app/ and app_b/")
     args = ap.parse_args()
 
-    app_path = args.app
-    if app_path is None:
-        found = sorted(glob.glob(os.path.join(ROOT, "..", "a510_mcu", "build", "*", "app", "app.bin")))
-        app_path = found[0] if found else None
-    app = open(app_path, "rb").read() if app_path else None
-
-    if args.sram:
-        sram_path = args.sram
+    if args.build:
+        build_dir = args.build
     else:
-        # Two images naming different boards are refused as a pair, so default to
-        # the shipped fwu_sram of the same board as the app image.
-        same_board = shipped_sram(fields(app)["board_id"] if app else None)
-        sram_path = same_board[0] if same_board else (shipped_sram() or [None])[0]
-        if sram_path is None:
-            sys.exit("no fwu_sram image under fwu_sram_bin/ (pass --sram)")
-    if not os.path.exists(sram_path):
-        sys.exit("no fwu_sram image: %s (pass --sram)" % sram_path)
-
+        found = [d for d in sorted(glob.glob(os.path.join(ROOT, "..", "a510_mcu", "build", "*")))
+                 if os.path.exists(os.path.join(d, "app_b", "app.bin"))]
+        if not found:
+            sys.exit("no a510_mcu build with app/app.bin and app_b/app.bin (pass --build)")
+        build_dir = found[0]
+    a_path = os.path.join(build_dir, "app", "app.bin")
+    b_path = os.path.join(build_dir, "app_b", "app.bin")
+    a_img = open(a_path, "rb").read()
+    b_img = open(b_path, "rb").read()
     tool = build()
-    sram = open(sram_path, "rb").read()
 
-    if app:
-        f = fields(app)
-        print("app  %s: board=%s(%d) image_size=%d vectors=0x%08x git=%s"
-              % (os.path.basename(app_path), f["board_name"], f["board_id"],
+    for label, img in (("slot A", a_img), ("slot B", b_img)):
+        f = fields(img)
+        print("%s %s: board=%s(%d) image_size=%d vectors=0x%08x git=%s"
+              % (label, os.path.relpath(build_dir), f["board_name"], f["board_id"],
                  f["image_size"], f["vector_addr"], f["git_sha"]))
-    f = fields(sram)
-    print("sram %s: board=%s(%d) image_size=%d vectors=0x%08x git=%s"
-          % (os.path.basename(sram_path), f["board_name"], f["board_id"],
-             f["image_size"], f["vector_addr"], f["git_sha"]))
 
     failures = []
     total = 0
 
-    def expect(name, want_rc, rc, first, why=""):
+    def expect(name, want_rc, rc, first, must_contain=None):
         nonlocal total
         total += 1
-        ok = rc == want_rc
-        print("  %-38s exit=%d %s%s" % (name, rc, "ok" if ok else "FAIL (want %d)" % want_rc, why))
+        ok = rc == want_rc and (must_contain is None or must_contain in first)
+        print("  %-38s exit=%d %s" % (name, rc, "ok" if ok else "FAIL (want %d)" % want_rc))
         if not ok:
             failures.append("%s: exit %d, want %d (%s)" % (name, rc, want_rc, first))
-        return ok
 
-    print("== rejecting bad images (%s) ==" % os.path.basename(app_path or "-"))
-    if app:
-        for name, blob in app_cases(app):
-            with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as f:
-                f.write(blob)
-                path = f.name
-            try:
-                rc, out = run(tool, path, sram_path)
-                expect(name, 2, rc, first_line(out))
-            finally:
-                os.unlink(path)
-    else:
-        print("  (no app.bin found; pass --app or build the firmware to cover these)")
-    for name, blob in sram_cases(sram):
-        with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as f:
-            f.write(blob)
-            path = f.name
+    print("== rejecting bad slot A images ==")
+    for name, blob in slot_a_cases(a_img):
+        path = tmpfile(blob)
         try:
-            rc, out = run(tool, app_path or sram_path, path)
-            if app_path is None:
-                print("  %-38s skipped (needs --app)" % name)
-            else:
-                expect(name, 2, rc, first_line(out))
+            rc, out = run(tool, path, b_path)
+            expect(name, 2, rc, first_line(out))
+        finally:
+            os.unlink(path)
+    print("== rejecting bad slot B images ==")
+    for name, blob in slot_b_cases(b_img):
+        path = tmpfile(blob)
+        try:
+            rc, out = run(tool, a_path, path)
+            expect(name, 2, rc, first_line(out))
         finally:
             os.unlink(path)
 
-    print("== image pair consistency (refused offline, before any I2C) ==")
-    if app:
-        app_board = fields(app)["board_id"]
-        other = [p for p in shipped_sram() if fields(open(p, "rb").read())["board_id"] != app_board]
-        if not other:
-            print("  %-38s skipped (no shipped fwu_sram for another board)"
-                  % "pair from two different boards")
-        else:
-            rc, out = run(tool, app_path, other[0])
-            ok = rc == 2 and "image pair mismatch" in out
-            total += 1
-            print("  %-38s exit=%d %s" % ("pair from two different boards", rc,
-                                          "ok" if ok else "FAIL (want exit 2 + 'image pair mismatch')"))
-            if not ok:
-                failures.append("pair from two different boards: exit %d, want 2 with 'image "
-                                "pair mismatch' (%s)" % (rc, first_line(out)))
-    else:
-        print("  skipped (needs --app)")
+    print("== pair consistency (refused offline, before any I2C) ==")
+    rc, out = run(tool, b_path, a_path)
+    expect("swapped slots", 2, rc, first_line(out), "this is a slot B image")
+    path = tmpfile(other_board(b_img))
+    try:
+        rc, out = run(tool, a_path, path)
+        expect("pair from two different boards", 2, rc, first_line(out), "image pair mismatch")
+    finally:
+        os.unlink(path)
 
     print("== usage ==")
     rc, out = run(tool, "-h")
     expect("--help", 0, rc, first_line(out))
     rc, out = run(tool)
     expect("no arguments", 1, rc, first_line(out))
+    rc, out = run(tool, a_path)
+    expect("one argument", 1, rc, first_line(out))
 
     print("== accepting a real pair (stops at the I2C layer) ==")
-    if app:
-        rc, out = run(tool, app_path, sram_path)
-        expect("app + fwu_sram", 1, rc, first_line(out))
-        total += 1
-        if "Failed to initialize I2C driver" in out:
-            print("  %-38s ok (%s)" % ("stopped in the I2C layer", first_line(out)))
-        else:
-            print("  %-38s FAIL (%s)" % ("stopped in the I2C layer", first_line(out)))
-            failures.append("accepted pair did not stop in the I2C layer: %s" % first_line(out))
-    else:
-        print("  skipped (needs --app)")
+    rc, out = run(tool, a_path, b_path)
+    expect("slot A + slot B", 1, rc, out, "Failed to initialize I2C driver")
 
     print()
     if failures:

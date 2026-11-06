@@ -8,20 +8,18 @@
 #include <sys/stat.h>
 
 /*
- * Memory layout, from the firmware's common/memory.h. The MCU never
- * bound-checks the bytes it receives (fwu_fifo_process.c writes APP_BASE+count
- * for as long as the host keeps sending), so the host is the only place that can
- * catch an over-long image.
+ * A/B slot layout, from the firmware's common/memory.h. The last 16 bytes of a
+ * slot hold the trailer the MCU keeps its slot state in, so an image may use the
+ * rest only.
  */
-#define APP_BASE 0x08008000u
-#define APP_SIZE (992u * 1024u)
-#define FWU_SRAM_BASE 0x20001800u
-#define FWU_SRAM_SIZE (250u * 1024u)
+#define SLOT_A_BASE 0x08010000u
+#define SLOT_B_BASE 0x08090000u
+#define SLOT_IMAGE_SIZE (448u * 1024u - 16u)
 
-/* The STM32F429 has 256KB of SRAM at 0x20000000; the FWU_SRAM image's stack top
- * is the very end of it. */
+/* SRAM1+SRAM2+SRAM3 are 192KB contiguous from 0x20000000; the APP stack top
+ * lies inside it. */
 #define SRAM_BASE 0x20000000u
-#define SRAM_END 0x20040000u
+#define SRAM_END 0x20030000u
 
 /*
  * The vector table sits IMAGE_VECTOR_OFFSET bytes into the image: the firmware's
@@ -34,8 +32,8 @@
 #define IMAGE_MIN_SIZE 512u
 
 static const image_region_t regions[] = {
-    [IMAGE_ROLE_APP] = { "app", APP_BASE, APP_SIZE },
-    [IMAGE_ROLE_FWU_SRAM] = { "fwu_sram", FWU_SRAM_BASE, FWU_SRAM_SIZE },
+    [IMAGE_ROLE_SLOT_A] = { "slot A", SLOT_A_BASE, SLOT_IMAGE_SIZE },
+    [IMAGE_ROLE_SLOT_B] = { "slot B", SLOT_B_BASE, SLOT_IMAGE_SIZE },
 };
 
 const image_region_t *image_role_region(image_role_t role)
@@ -121,7 +119,7 @@ bool image_check_file(const char *path, image_role_t role, image_info_t *info,
 {
     const image_region_t *region = image_role_region(role);
     const image_region_t *other = image_role_region(
-        role == IMAGE_ROLE_APP ? IMAGE_ROLE_FWU_SRAM : IMAGE_ROLE_APP);
+        role == IMAGE_ROLE_SLOT_A ? IMAGE_ROLE_SLOT_B : IMAGE_ROLE_SLOT_A);
     image_info_t tmp;
     struct stat st;
     uint8_t hdr[IMAGE_HEADER_SIZE];
@@ -206,7 +204,7 @@ bool image_check_file(const char *path, image_role_t role, image_info_t *info,
     if (tmp.image_size > region->size) {
         fail(err, err_len,
              "the image is %" PRIu32 " bytes, more than the %s region holds (%u bytes from "
-             "0x%08x); the MCU does not bound-check the stream", tmp.image_size, region->name,
+             "0x%08x)", tmp.image_size, region->name,
              (unsigned)region->size, (unsigned)region->base);
         goto done;
     }
@@ -229,9 +227,9 @@ bool image_check_file(const char *path, image_role_t role, image_info_t *info,
     }
 
     /*
-     * Both images carry a vector table at their window base + 0x200, so the
-     * address tells us which image this is. A swapped pair is the failure the
-     * MCU cannot survive: it jumps to whatever it finds there.
+     * Both images carry a vector table at their slot base + 0x200, so the
+     * address tells us which slot the file was linked for. The MCU refuses a
+     * file linked for the other slot; catching it here keeps the board untouched.
      */
     if (!addr_in(region, tmp.vector_addr)) {
         if (addr_in(other, tmp.vector_addr)) {
@@ -240,10 +238,11 @@ bool image_check_file(const char *path, image_role_t role, image_info_t *info,
                  "this position", other->name, (unsigned)tmp.vector_addr, region->name);
         } else {
             fail(err, err_len,
-                 "vector_addr 0x%08x is in neither the app flash window [0x%08x,0x%08x) nor "
-                 "the FWU SRAM window [0x%08x,0x%08x)", (unsigned)tmp.vector_addr,
-                 (unsigned)APP_BASE, (unsigned)(APP_BASE + APP_SIZE), (unsigned)FWU_SRAM_BASE,
-                 (unsigned)(FWU_SRAM_BASE + FWU_SRAM_SIZE));
+                 "vector_addr 0x%08x is in neither slot A [0x%08x,0x%08x) nor slot B "
+                 "[0x%08x,0x%08x): not an A/B image (pre-0x0300 firmware layout?)",
+                 (unsigned)tmp.vector_addr, (unsigned)SLOT_A_BASE,
+                 (unsigned)(SLOT_A_BASE + SLOT_IMAGE_SIZE), (unsigned)SLOT_B_BASE,
+                 (unsigned)(SLOT_B_BASE + SLOT_IMAGE_SIZE));
         }
         goto done;
     }
