@@ -119,8 +119,8 @@ static uint64_t reloc_table_start(const uint8_t *buf, uint64_t size, uint32_t *c
 }
 
 /* Header and vectors shared by every check; fills *tmp except the CRC check. */
-static bool check_format(const uint8_t *buf, uint64_t size, const uint8_t *vec,
-                         image_info_t *tmp, char *err, size_t err_len)
+static bool check_format(const uint8_t *buf, uint64_t size, image_info_t *tmp,
+                         char *err, size_t err_len)
 {
     const char *canonical;
     uint32_t sp, pc;
@@ -176,8 +176,8 @@ static bool check_format(const uint8_t *buf, uint64_t size, const uint8_t *vec,
         return fail(err, err_len, "vector table at 0x%08x is outside the image",
                     (unsigned)tmp->vector_addr);
     }
-    sp = rd32(vec);
-    pc = rd32(vec + 4);
+    sp = rd32(buf + IMAGE_VECTOR_OFFSET);
+    pc = rd32(buf + IMAGE_VECTOR_OFFSET + 4);
     if (sp < SRAM_BASE || sp > SRAM_END || (sp & 3u) != 0) {
         return fail(err, err_len, "initial stack pointer 0x%08x is outside SRAM [0x%08x,0x%08x] "
                     "or unaligned", sp, (unsigned)SRAM_BASE, (unsigned)SRAM_END);
@@ -216,11 +216,11 @@ static bool check_table(const uint8_t *buf, uint64_t start, uint32_t count,
     return true;
 }
 
-bool image_check_file(const char *path, image_info_t *info, char *err, size_t err_len)
+bool image_load(const char *path, uint8_t buf[IMAGE_SLOT_SIZE], image_info_t *info,
+                char *err, size_t err_len)
 {
     image_info_t tmp;
     struct stat st;
-    static uint8_t buf[IMAGE_SLOT_SIZE];
     uint64_t table_start;
     uint32_t crc;
     FILE *fp;
@@ -234,7 +234,7 @@ bool image_check_file(const char *path, image_info_t *info, char *err, size_t er
         return fail(err, err_len, "'%s' is not a regular file", path);
     }
     tmp.file_size = (uint64_t)st.st_size;
-    if (tmp.file_size > sizeof buf) {
+    if (tmp.file_size > IMAGE_SLOT_SIZE) {
         return fail(err, err_len, "'%s' is %" PRIu64 " bytes, more than a slot holds (%u)",
                     path, tmp.file_size, (unsigned)IMAGE_SLOT_SIZE);
     }
@@ -248,7 +248,7 @@ bool image_check_file(const char *path, image_info_t *info, char *err, size_t er
         return fail(err, err_len, "cannot read '%s': %s", path, strerror(errno));
     }
 
-    ok = check_format(buf, tmp.file_size, buf + IMAGE_VECTOR_OFFSET, &tmp, err, err_len);
+    ok = check_format(buf, tmp.file_size, &tmp, err, err_len);
     if (ok) {
         crc = crc32_update(0, buf + IMAGE_HEADER_SIZE, tmp.image_size);
         if (crc != tmp.crc32) {
@@ -267,27 +267,16 @@ bool image_check_file(const char *path, image_info_t *info, char *err, size_t er
     return ok;
 }
 
-bool image_relocate(const image_info_t *info, const uint8_t *in, uint8_t *out,
-                    char *err, size_t err_len)
+void image_relocate(const image_info_t *info, uint8_t *buf)
 {
     uint64_t start = info->file_size - 8 - (uint64_t)info->reloc_count * 4u;
-    uint32_t crc;
 
-    memcpy(out, in, (size_t)info->file_size);
     for (uint32_t i = 0; i < info->reloc_count; i++) {
-        uint32_t off = rd32(out + start + 4u * i);
-        uint32_t value = rd32(out + off);
+        uint8_t *word = buf + rd32(buf + start + 4u * i);
 
-        /* image_check_file verified the slot A address; re-check in case of a bug. */
-        if (value < IMAGE_SLOT_A_BASE || value >= SLOT_END) {
-            return fail(err, err_len, "relocation entry %" PRIu32 " (offset 0x%x) holds "
-                        "0x%08x, not a slot A address", i, off, value);
-        }
-        wr32(out + off, value + (IMAGE_SLOT_B_BASE - IMAGE_SLOT_A_BASE));
+        wr32(word, rd32(word) + (IMAGE_SLOT_B_BASE - IMAGE_SLOT_A_BASE));
     }
-    crc = crc32_update(0, out + IMAGE_HEADER_SIZE, info->image_size);
-    wr32(out + 4, crc);
-    return true;
+    wr32(buf + 4, crc32_update(0, buf + IMAGE_HEADER_SIZE, info->image_size));
 }
 
 void image_print_summary(const char *label, const char *path, const image_info_t *info)

@@ -220,10 +220,11 @@ int main(int argc, char **argv)
 
     // The image is checked before the first I2C access, so a bad file leaves the
     // board running whatever it already has.
+    static uint8_t data[IMAGE_SLOT_SIZE];
     image_info_t image;
     char err[512];
 
-    if (!image_check_file(argv[1], &image, err, sizeof err)) {
+    if (!image_load(argv[1], data, &image, err, sizeof err)) {
         fprintf(stderr, "image rejected: %s\n", err);
         return EXIT_IMAGE_CHECK_FAILED;
     }
@@ -235,26 +236,10 @@ int main(int argc, char **argv)
     uint16_t chunk = read_u16_le(FWU_FIFO_LENGTH_ADDR, "FIFO length");
     ASSERT_FATAL(chunk != 0, "FWU_FIFO_LENGTH reads 0");
 
-    /*
-     * Slot A gets the file as built. Slot B needs the same bytes with the slot
-     * A addresses in its relocation table moved by one slot; the file on disk
-     * is never modified.
-     */
-    uint8_t *data = malloc((size_t)image.file_size);
-    ASSERT_FATAL(data != NULL, "Buy more RAM!");
-    const char *source = argv[1];
-    FILE *fp = fopen(argv[1], "rb");
-    ASSERT_FATAL(fp != NULL && fread(data, 1, (size_t)image.file_size, fp) == image.file_size,
-                 "Failed to read %s", argv[1]);
-    fclose(fp);
+    /* Slot A gets the file as built; slot B the same bytes relocated in memory.
+     * The file on disk is never modified. */
     if (target == 1U) {
-        uint8_t *moved = malloc((size_t)image.file_size);
-        ASSERT_FATAL(moved != NULL, "Buy more RAM!");
-        ASSERT_FATAL(image_relocate(&image, data, moved, err, sizeof err),
-                     "Cannot relocate the image for slot B: %s", err);
-        free(data);
-        data = moved;
-        source = "relocated image";
+        image_relocate(&image, data);
         printf("     relocated %" PRIu32 " addresses for slot B\n", image.reloc_count);
     }
 
@@ -264,7 +249,7 @@ int main(int argc, char **argv)
     send_fwu_cmd(FWU_CMD_REQUEST);
     wait_status(FWU_STATUS_BUSY, REQUEST_TIMEOUT_MS, "erase");
     printf("done\n     writing... ");
-    send_buffer(data, (size_t)image.file_size, chunk, source);
+    send_buffer(data, (size_t)image.file_size, chunk, target ? "relocated image" : argv[1]);
 
     send_fwu_cmd(FWU_CMD_FILE_SEND_DONE);
     uint8_t status = wait_status(FWU_STATUS_FIFO_NOT_EMPTY | FWU_STATUS_BUSY,
@@ -276,7 +261,6 @@ int main(int argc, char **argv)
     send_fwu_cmd(FWU_CMD_ACTIVATE);
     wait_activated(target);
 
-    free(data);
     ASSERT_FATAL(platform_i2c_driver.deinit() == 0, "Failed to deinitialize I2C driver");
     return 0;
 }

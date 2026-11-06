@@ -56,22 +56,21 @@ typedef struct {
 const char *image_board_name(uint32_t board_id);
 
 /*
- * Check one released image file: header, CRC, board, slot A link address, the
- * slot relocation table and the vectors. This never touches the MCU: it only
- * reads `path`. Returns true when every check passed and filled `*info`; on
- * failure it writes a one-line reason (expected and actual values included) to
- * `err` and returns false.
+ * Read a released image file into `buf` and check it: header, CRC, board, slot A
+ * link address, the slot relocation table and the vectors. This never touches
+ * the MCU. Returns true when every check passed and filled `*info`; on failure
+ * it writes a one-line reason (expected and actual values included) to `err`
+ * and returns false.
  */
-bool image_check_file(const char *path, image_info_t *info, char *err, size_t err_len);
+bool image_load(const char *path, uint8_t buf[IMAGE_SLOT_SIZE], image_info_t *info,
+                char *err, size_t err_len);
 
 /*
- * Copy `in` to `out` relocated for slot B: every table entry gets its stored
- * slot A address raised by one slot, then the header CRC is recomputed. `out`
- * must hold `info->file_size` bytes. Returns true, or false with a reason in
- * `err` when an entry does not hold the slot A address it must have.
+ * Relocate a loaded image for slot B in place: every table entry gets its slot A
+ * address raised by one slot (image_load verified each one), then the header
+ * CRC is recomputed.
  */
-bool image_relocate(const image_info_t *info, const uint8_t *in, uint8_t *out,
-                    char *err, size_t err_len);
+void image_relocate(const image_info_t *info, uint8_t *buf);
 
 /* One-line header summary, for the operator log. */
 void image_print_summary(const char *label, const char *path, const image_info_t *info);
