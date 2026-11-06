@@ -56,6 +56,7 @@
 #define FWU_CMD_REQUEST 0x01
 #define FWU_CMD_FILE_SEND_DONE 0x03
 #define FWU_CMD_ACTIVATE 0x04
+#define FWU_CMD_COMMIT 0x05
 
 #define FWU_STATUS_FIFO_NOT_EMPTY (1u << 0)
 #define FWU_STATUS_FIFO_OVERFLOW (1u << 1)
@@ -119,6 +120,11 @@ static uint8_t wait_status(uint8_t busy_bits, int timeout_ms, const char *what)
     }
 }
 
+/*
+ * Flash erase/program stalls the whole MCU, its I2C slave included, so the MCU
+ * only programs a chunk after COMMIT, while this tool just polls FWU_STATUS
+ * (wait_status retries failed reads). Data is written only while it is idle.
+ */
 static void send_buffer(uint8_t *data, size_t size, uint16_t chunk, const char *what)
 {
     int last_percent = -1;
@@ -131,6 +137,7 @@ static void send_buffer(uint8_t *data, size_t size, uint16_t chunk, const char *
         ASSERT_FATAL(platform_i2c_driver.write(I2C_ADDR, FWU_FIFO_ADDR, data + offset, n) == 0,
                      "I2C write failed (%s): reg=0x%02x offset=%zu len=%zu: %s", what,
                      FWU_FIFO_ADDR, offset, n, strerror(errno));
+        send_fwu_cmd(FWU_CMD_COMMIT);
         int percent = (int)((offset + n) * 100 / size);
         if (percent != last_percent) {
             printf("\r%3d%%", percent);

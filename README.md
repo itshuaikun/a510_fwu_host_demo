@@ -60,8 +60,10 @@ What happens:
 1. `REQUEST`: the running APP erases its **inactive** slot in the background. It
    first waits until the running slot has confirmed itself (30 s after the MCU
    started), so this step can take up to ~40 s.
-2. The image is streamed through `FWU_FIFO` and written to the inactive slot
-   while the APP keeps running (power, protection, PERST follow).
+2. The image is streamed through `FWU_FIFO`, one chunk at a time, each
+   followed by `COMMIT`. Flash programming stalls the whole MCU (its I2C slave
+   included), so the MCU only writes a chunk to the inactive slot after
+   `COMMIT`, while the tool just polls `FWU_STATUS` and retries failed reads.
 3. `FILE_SEND_DONE`: the MCU checks header, CRC, board and link address; `READY`.
 4. `ACTIVATE`: warm switch to the new slot. The MCU is not reset, so the A510
    stays powered and its PCIe link stays up. The tool waits until the APP
