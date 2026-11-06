@@ -2,6 +2,7 @@
 #include <stddef.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <inttypes.h>
 #include <stdlib.h>
 #include <errno.h>
 #include <string.h>
@@ -18,6 +19,10 @@
  * switch is a warm restart: the A510 keeps its power and the PCIe link stays
  * up. Interrupting this tool at any point only leaves the inactive slot
  * unfinished; the running firmware is never touched until ACTIVATE.
+ *
+ * One image is released per build, linked for slot A. When the MCU runs from
+ * slot A this tool sends it as is; when it runs from slot B the image is
+ * relocated in memory (image_relocate) before it is sent.
  * Protocol: a510_mcu/doc/interface/host_fwu_guide.md.
  */
 
@@ -114,30 +119,19 @@ static uint8_t wait_status(uint8_t busy_bits, int timeout_ms, const char *what)
     }
 }
 
-static int send_file(const char *filename, uint16_t chunk)
+static void send_buffer(uint8_t *data, size_t size, uint16_t chunk, const char *what)
 {
-    FILE *fp = fopen(filename, "rb");
-    uint8_t *buf = malloc(chunk);
-    size_t file_size, offset = 0;
     int last_percent = -1;
 
-    ASSERT_FATAL(fp != NULL && buf != NULL, "Failed to open %s", filename);
-    fseek(fp, 0, SEEK_END);
-    file_size = (size_t)ftell(fp);
-    fseek(fp, 0, SEEK_SET);
+    for (size_t offset = 0; offset < size; offset += chunk) {
+        size_t n = (size - offset > chunk) ? chunk : size - offset;
 
-    while (offset < file_size) {
-        size_t n = (file_size - offset > chunk) ? chunk : file_size - offset;
-
-        ASSERT_FATAL(fread(buf, 1, n, fp) == n, "Failed to read %s at offset %zu",
-                     filename, offset);
         wait_status(FWU_STATUS_FIFO_NOT_EMPTY | FWU_STATUS_BUSY, DRAIN_TIMEOUT_MS,
                     "FIFO drain");
-        ASSERT_FATAL(platform_i2c_driver.write(I2C_ADDR, FWU_FIFO_ADDR, buf, n) == 0,
-                     "I2C write failed: reg=0x%02x offset=%zu len=%zu: %s", FWU_FIFO_ADDR,
-                     offset, n, strerror(errno));
-        offset += n;
-        int percent = (int)(offset * 100 / file_size);
+        ASSERT_FATAL(platform_i2c_driver.write(I2C_ADDR, FWU_FIFO_ADDR, data + offset, n) == 0,
+                     "I2C write failed (%s): reg=0x%02x offset=%zu len=%zu: %s", what,
+                     FWU_FIFO_ADDR, offset, n, strerror(errno));
+        int percent = (int)((offset + n) * 100 / size);
         if (percent != last_percent) {
             printf("\r%3d%%", percent);
             fflush(stdout);
@@ -145,13 +139,11 @@ static int send_file(const char *filename, uint16_t chunk)
         }
     }
     printf("\n");
-    fclose(fp);
-    free(buf);
-    return 0;
 }
 
-/* Returns the slot the MCU will write (FWU_SLOT low nibble). */
-static unsigned check_mcu(const image_info_t images[2], uint8_t *running)
+/* FWU_SLOT holds the running slot: 0 = A, 1 = B, 0x0F = bootloader. The MCU
+ * always writes the other slot (slot A from the bootloader). */
+static unsigned check_mcu(const image_info_t *image)
 {
     uint16_t version = read_u16_le(MEM_DESC_VERSION_ADDR, "memmap version");
 
@@ -168,22 +160,23 @@ static unsigned check_mcu(const image_info_t images[2], uint8_t *running)
     const char *mcu_name = image_board_name(board);
 
     ASSERT_FATAL(mcu_name != NULL, "BOARD_ID reads 0x%04x, which is not a board identity", board);
-    if (images[0].board_id != board) {
-        fprintf(stderr, "board mismatch: the MCU is a %s (BOARD_ID %u), but the images are for "
-                "%s (%u)\n", mcu_name, board, images[0].board_name, images[0].board_id);
+    if (image->board_id != board) {
+        fprintf(stderr, "board mismatch: the MCU is a %s (BOARD_ID %u), but the image is for "
+                "%s (%u)\n", mcu_name, board, image->board_name, image->board_id);
         exit(EXIT_IMAGE_CHECK_FAILED);
     }
 
-    uint8_t slot;
-    ASSERT_FATAL(read_u8(FWU_SLOT_ADDR, &slot) == 0, "Failed to read FWU_SLOT: %s",
+    uint8_t running;
+    ASSERT_FATAL(read_u8(FWU_SLOT_ADDR, &running) == 0, "Failed to read FWU_SLOT: %s",
                  strerror(errno));
-    unsigned target = slot & 0x0Fu;
-    ASSERT_FATAL(target < 2, "FWU_SLOT 0x%02x names no target slot", slot);
-    *running = (uint8_t)(slot >> 4);
+    ASSERT_FATAL((running <= 1) || (running == 0x0Fu), "FWU_SLOT 0x%02x is not a slot",
+                 running);
 
+    /* Bootloader rescue restores slot A; otherwise the slot not running. */
+    unsigned target = (running == 0x0Fu) ? 0U : 1U - running;
     printf("     board: %s (BOARD_ID=0x%04x, memmap version=0x%04x), running %s, "
            "writing slot %c\n", mcu_name, board, version,
-           *running == 0x0F ? "the bootloader (rescue)" : (*running ? "slot B" : "slot A"),
+           running == 0x0Fu ? "the bootloader (rescue)" : (running ? "slot B" : "slot A"),
            'A' + target);
     return target;
 }
@@ -197,7 +190,7 @@ static void wait_activated(unsigned target)
     while (now_ms() < deadline) {
         usleep(100000);
         if (read_u8(BOOT_STATE_ADDR, &state) == 0 && state == BOOT_STATE_APP &&
-            read_u8(FWU_SLOT_ADDR, &slot) == 0 && (slot >> 4) == target) {
+            read_u8(FWU_SLOT_ADDR, &slot) == 0 && slot == target) {
             printf("     slot %c running; it confirms itself after 30 s, a crash before that "
                    "rolls back\n", 'A' + target);
             return;
@@ -210,9 +203,8 @@ static void wait_activated(unsigned target)
 
 static void print_usage(const char *prog)
 {
-    fprintf(stderr, "Usage: %s <slot_a.bin> <slot_b.bin>\n"
-                    "  slot_a.bin: a510_mcu build/<board>/app/app.bin\n"
-                    "  slot_b.bin: a510_mcu build/<board>/app_b/app.bin\n", prog);
+    fprintf(stderr, "Usage: %s <app.bin>\n"
+                    "  app.bin: a510_mcu build/<board>/app/app.bin\n", prog);
 }
 
 int main(int argc, char **argv)
@@ -221,43 +213,50 @@ int main(int argc, char **argv)
         print_usage(argv[0]);
         return 0;
     }
-    if (argc != 3) {
+    if (argc != 2) {
         print_usage(argv[0]);
         exit(EXIT_FAILURE);
     }
 
-    // Both files are checked before the first I2C access, so a bad file leaves
-    // the board running whatever it already has.
-    image_info_t images[2];
+    // The image is checked before the first I2C access, so a bad file leaves the
+    // board running whatever it already has.
+    image_info_t image;
     char err[512];
 
-    for (unsigned i = 0; i < 2; i++) {
-        if (!image_check_file(argv[1 + i], (image_role_t)i, &images[i], err, sizeof err)) {
-            fprintf(stderr, "slot %c image rejected: %s\n", 'A' + i, err);
-            return EXIT_IMAGE_CHECK_FAILED;
-        }
-    }
-    if (images[0].board_id != images[1].board_id) {
-        fprintf(stderr,
-                "image pair mismatch: slot A is for %s (%u), slot B for %s (%u); both must be "
-                "built for the same board\n", images[0].board_name, images[0].board_id,
-                images[1].board_name, images[1].board_id);
+    if (!image_check_file(argv[1], &image, err, sizeof err)) {
+        fprintf(stderr, "image rejected: %s\n", err);
         return EXIT_IMAGE_CHECK_FAILED;
     }
-
     printf("image check passed:\n");
-    image_print_summary("slot A", argv[1], &images[0]);
-    image_print_summary("slot B", argv[2], &images[1]);
-    if (strcmp(images[0].git_sha, images[1].git_sha) != 0) {
-        printf("  note: the two images come from different commits (%s vs %s)\n",
-               images[0].git_sha, images[1].git_sha);
-    }
+    image_print_summary("app", argv[1], &image);
 
     ASSERT_FATAL(platform_i2c_driver.init() == 0, "Failed to initialize I2C driver");
-    uint8_t running;
-    unsigned target = check_mcu(images, &running);
+    unsigned target = check_mcu(&image);
     uint16_t chunk = read_u16_le(FWU_FIFO_LENGTH_ADDR, "FIFO length");
     ASSERT_FATAL(chunk != 0, "FWU_FIFO_LENGTH reads 0");
+
+    /*
+     * Slot A gets the file as built. Slot B needs the same bytes with the slot
+     * A addresses in its relocation table moved by one slot; the file on disk
+     * is never modified.
+     */
+    uint8_t *data = malloc((size_t)image.file_size);
+    ASSERT_FATAL(data != NULL, "Buy more RAM!");
+    const char *source = argv[1];
+    FILE *fp = fopen(argv[1], "rb");
+    ASSERT_FATAL(fp != NULL && fread(data, 1, (size_t)image.file_size, fp) == image.file_size,
+                 "Failed to read %s", argv[1]);
+    fclose(fp);
+    if (target == 1U) {
+        uint8_t *moved = malloc((size_t)image.file_size);
+        ASSERT_FATAL(moved != NULL, "Buy more RAM!");
+        ASSERT_FATAL(image_relocate(&image, data, moved, err, sizeof err),
+                     "Cannot relocate the image for slot B: %s", err);
+        free(data);
+        data = moved;
+        source = "relocated image";
+        printf("     relocated %" PRIu32 " addresses for slot B\n", image.reloc_count);
+    }
 
     printf("     erasing slot %c (waits for the running slot to confirm itself)... ",
            'A' + target);
@@ -265,7 +264,7 @@ int main(int argc, char **argv)
     send_fwu_cmd(FWU_CMD_REQUEST);
     wait_status(FWU_STATUS_BUSY, REQUEST_TIMEOUT_MS, "erase");
     printf("done\n     writing... ");
-    ASSERT_FATAL(send_file(argv[1 + target], chunk) == 0, "Failed to send %s", argv[1 + target]);
+    send_buffer(data, (size_t)image.file_size, chunk, source);
 
     send_fwu_cmd(FWU_CMD_FILE_SEND_DONE);
     uint8_t status = wait_status(FWU_STATUS_FIFO_NOT_EMPTY | FWU_STATUS_BUSY,
@@ -277,6 +276,7 @@ int main(int argc, char **argv)
     send_fwu_cmd(FWU_CMD_ACTIVATE);
     wait_activated(target);
 
+    free(data);
     ASSERT_FATAL(platform_i2c_driver.deinit() == 0, "Failed to deinitialize I2C driver");
     return 0;
 }

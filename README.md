@@ -41,15 +41,18 @@ and corrupt the stream. Either backend auto-detects the bus by reading
 ## Usage
 
 Requires MCU firmware with memmap `VERSION >= 0x0300` (A/B slot FWU, see
-`a510_mcu/doc/interface/host_fwu_guide.md`). The firmware is linked once per
-flash slot, so pass both builds of the same commit; the tool sends the one the
-MCU asks for (`FWU_SLOT`).
+`a510_mcu/doc/interface/host_fwu_guide.md`). One image is released per
+build, linked for slot A, with a slot relocation table appended. The tool reads
+`FWU_SLOT` (the running slot) and writes the other one: running A -> slot B,
+running B or the bootloader -> slot A. For slot B it adds `0x80000` to every
+word the table lists and recomputes the CRC in memory; the file is never
+modified.
 
 ```bash
-./build/fwu_host_demo <slot_a.bin> <slot_b.bin>
+./build/fwu_host_demo <app.bin>
 
 # e.g. a D2 OAM board, from the a510_mcu build tree
-./build/fwu_host_demo ../a510_mcu/build/d2_oam/app/app.bin ../a510_mcu/build/d2_oam/app_b/app.bin
+./build/fwu_host_demo ../a510_mcu/build/d2_oam/app/app.bin
 ```
 
 What happens:
@@ -69,11 +72,11 @@ the previous slot. Firmware older than `0x0300` uses a different flash layout:
 flash `a510_mcu build/<board>/flash.bin` over SWD once.
 
 If no slot is valid the MCU waits in the bootloader (`BOOT_STATE=0`,
-`FWU_SLOT=0xF0`); the same command restores slot A (that path resets the MCU).
+`FWU_SLOT=0x0F`); the same command restores slot A (that path resets the MCU).
 
 ## Pre-check
 
-Both files are checked **before the first I2C access**, and the board is asked
+The file is checked **before the first I2C access**, and the board is asked
 which board it is before anything is written. A rejected file or a wrong board
 therefore leaves the MCU running what it already has.
 
@@ -87,17 +90,22 @@ Exit codes:
 
 Per file: readable regular file; magic `0x9CA3`; header version 2;
 `image_size == file size - 36`; CRC32 of everything after the header; the image
-fits a slot (448KB - 16B); `vector_addr` is exactly the slot base + `0x200`
-(slot A `0x08010000`, slot B `0x08090000`), so swapped files are refused; the
-initial stack pointer is in SRAM and the reset vector has its Thumb bit set and
-points into the image. Both files must name the same board, and that board must
-match the MCU's `BOARD_ID` (`0x52`).
+fits a slot (448KB - 16B); `vector_addr` is exactly slot A `0x08010000` +
+`0x200`; the initial stack pointer is in SRAM and the reset vector has its
+Thumb bit set and points into the image; the slot relocation table at the end
+(`[u32 offset]*N [u32 N] [u32 0x4C455253]`) has aligned offsets inside the
+binary, each holding a slot A address. The board must match the MCU's
+`BOARD_ID` (`0x52`).
 
 Offline regression (no MCU needed):
 
 ```bash
 python3 tests/image_precheck.py [--build ../a510_mcu/build/<board>]
 ```
+
+It also checks that the tool's slot B relocation is byte-identical to
+`a510_mcu/tools/slot_reloc.py relocate` and to the slot B link the firmware
+build keeps for that check (`build/<board>/app_reloc_check/app.bin`).
 
 ## Side effects on the host
 

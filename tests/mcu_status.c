@@ -44,7 +44,7 @@ int main(void)
      * reads back 0x0000. */
     kv_u16("board_id", m, 0x52);
     /* A/B FWU (memmap version >= 0x0300): running slot 0=A, 1=B, F=bootloader. */
-    printf("running_slot=%X\n", fwu[0] >> 4);
+    printf("running_slot=%X\n", fwu[0]);
     printf("fwu_status=0x%02X\n", fwu[1]);
     kv_u16("total_power", m, 0x04);
     kv_u16("junction_temp", m, 0x06);

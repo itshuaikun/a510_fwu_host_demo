@@ -7,39 +7,15 @@
 #include <string.h>
 #include <sys/stat.h>
 
-/*
- * A/B slot layout, from the firmware's common/memory.h. The last 16 bytes of a
- * slot hold the trailer the MCU keeps its slot state in, so an image may use the
- * rest only.
- */
-#define SLOT_A_BASE 0x08010000u
-#define SLOT_B_BASE 0x08090000u
-#define SLOT_IMAGE_SIZE (448u * 1024u - 16u)
-
 /* SRAM1+SRAM2+SRAM3 are 192KB contiguous from 0x20000000; the APP stack top
  * lies inside it. */
 #define SRAM_BASE 0x20000000u
 #define SRAM_END 0x20030000u
 
-/*
- * The vector table sits IMAGE_VECTOR_OFFSET bytes into the image: the firmware's
- * linker script keeps .image_hdr first and puts .isr_vector at ALIGN(512), and
- * the 36-byte header is smaller than that alignment.
- */
-#define IMAGE_VECTOR_OFFSET 0x200u
-
 /* A vector table needs at least the initial SP and the reset vector. */
 #define IMAGE_MIN_SIZE 512u
 
-static const image_region_t regions[] = {
-    [IMAGE_ROLE_SLOT_A] = { "slot A", SLOT_A_BASE, SLOT_IMAGE_SIZE },
-    [IMAGE_ROLE_SLOT_B] = { "slot B", SLOT_B_BASE, SLOT_IMAGE_SIZE },
-};
-
-const image_region_t *image_role_region(image_role_t role)
-{
-    return &regions[role];
-}
+#define SLOT_END (IMAGE_SLOT_A_BASE + 448u * 1024u)
 
 const char *image_board_name(uint32_t board_id)
 {
@@ -81,6 +57,14 @@ static uint32_t rd32(const uint8_t *p)
            ((uint32_t)p[3] << 24);
 }
 
+static void wr32(uint8_t *p, uint32_t v)
+{
+    p[0] = (uint8_t)v;
+    p[1] = (uint8_t)(v >> 8);
+    p[2] = (uint8_t)(v >> 16);
+    p[3] = (uint8_t)(v >> 24);
+}
+
 /* Fixed-length ASCII field, NUL padded, copied as a NUL-terminated string. */
 static void decode_ascii(const uint8_t *raw, size_t len, char *out, size_t out_len)
 {
@@ -93,11 +77,8 @@ static void decode_ascii(const uint8_t *raw, size_t len, char *out, size_t out_l
     out[i] = '\0';
 }
 
-/*
- * Standard reflected CRC-32 (poly 0xEDB88320, init 0, final xor), the same value
- * zlib/binascii and the firmware's crc32.c produce. The running value is passed
- * in and out so the payload can be streamed.
- */
+/* Standard reflected CRC-32 (poly 0xEDB88320, init 0, final xor), the same value
+ * zlib/binascii and the firmware's crc32.c produce. */
 static uint32_t crc32_update(uint32_t crc, const uint8_t *data, size_t len)
 {
     crc = ~crc;
@@ -109,195 +90,210 @@ static uint32_t crc32_update(uint32_t crc, const uint8_t *data, size_t len)
     return ~crc;
 }
 
-static bool addr_in(const image_region_t *region, uint32_t addr)
+/* Where the relocation table starts, or 0 when the image has none. */
+static uint64_t reloc_table_start(const uint8_t *buf, uint64_t size, uint32_t *count,
+                                  char *err, size_t err_len)
 {
-    return addr >= region->base && addr < region->base + region->size;
+    uint32_t magic, n;
+    uint64_t start;
+
+    if (size < IMAGE_HEADER_SIZE + 8) {
+        fail(err, err_len, "too small to hold a slot relocation table");
+        return 0;
+    }
+    n = rd32(buf + size - 8);
+    magic = rd32(buf + size - 4);
+    if (magic != IMAGE_RELOC_MAGIC) {
+        fail(err, err_len, "no slot relocation table (magic 0x%08x at the end, expected 0x%08x); "
+             "rebuild the firmware with the current build.py", magic, IMAGE_RELOC_MAGIC);
+        return 0;
+    }
+    start = size - 8 - (uint64_t)n * 4u;
+    if (n == 0 || start < IMAGE_HEADER_SIZE || start > size - 8) {
+        fail(err, err_len, "slot relocation table is corrupt (%u entries in a %" PRIu64
+             "-byte file)", n, size);
+        return 0;
+    }
+    *count = n;
+    return start;
 }
 
-bool image_check_file(const char *path, image_role_t role, image_info_t *info,
-                      char *err, size_t err_len)
+/* Header and vectors shared by every check; fills *tmp except the CRC check. */
+static bool check_format(const uint8_t *buf, uint64_t size, const uint8_t *vec,
+                         image_info_t *tmp, char *err, size_t err_len)
 {
-    const image_region_t *region = image_role_region(role);
-    const image_region_t *other = image_role_region(
-        role == IMAGE_ROLE_SLOT_A ? IMAGE_ROLE_SLOT_B : IMAGE_ROLE_SLOT_A);
-    image_info_t tmp;
-    struct stat st;
-    uint8_t hdr[IMAGE_HEADER_SIZE];
-    uint8_t vec[8];
-    uint64_t payload;
-    uint32_t vector_off, crc, sp, pc;
     const char *canonical;
-    FILE *fp = NULL;
-    bool ok = false;
+    uint32_t sp, pc;
 
-    memset(&tmp, 0, sizeof tmp);
+    tmp->magic = (uint16_t)rd16(buf + 0);
+    tmp->version = (uint16_t)rd16(buf + 2);
+    tmp->crc32 = rd32(buf + 4);
+    tmp->image_size = rd32(buf + 8);
+    tmp->vector_addr = rd32(buf + 12);
+    tmp->board_id = rd32(buf + 24);
+    decode_ascii(buf + 16, IMAGE_GIT_SHA_LEN, tmp->git_sha, sizeof tmp->git_sha);
+    decode_ascii(buf + 28, IMAGE_BOARD_NAME_LEN, tmp->board_name, sizeof tmp->board_name);
 
-    if (stat(path, &st) != 0) {
-        fail(err, err_len, "cannot stat '%s': %s", path, strerror(errno));
-        return false;
+    if (tmp->magic != IMAGE_MAGIC) {
+        return fail(err, err_len, "not an A510 image: magic 0x%04x, expected 0x%04x",
+                    (unsigned)tmp->magic, (unsigned)IMAGE_MAGIC);
     }
-    if (!S_ISREG(st.st_mode)) {
-        fail(err, err_len, "'%s' is not a regular file", path);
-        return false;
+    if (tmp->version != IMAGE_VERSION_CURRENT) {
+        return fail(err, err_len, "unsupported image header version %u, expected %u",
+                    (unsigned)tmp->version, (unsigned)IMAGE_VERSION_CURRENT);
     }
-
-    fp = fopen(path, "rb");
-    if (fp == NULL) {
-        fail(err, err_len, "cannot open '%s': %s", path, strerror(errno));
-        return false;
-    }
-    tmp.file_size = (uint64_t)st.st_size;
-
-    if (fread(hdr, 1, sizeof hdr, fp) != sizeof hdr) {
-        fail(err, err_len, "only %" PRIu64 " bytes: too small for the %u-byte image header",
-             tmp.file_size, (unsigned)IMAGE_HEADER_SIZE);
-        goto done;
-    }
-
-    tmp.magic = (uint16_t)rd16(hdr + 0);
-    tmp.version = (uint16_t)rd16(hdr + 2);
-    tmp.crc32 = rd32(hdr + 4);
-    tmp.image_size = rd32(hdr + 8);
-    tmp.vector_addr = rd32(hdr + 12);
-    tmp.board_id = rd32(hdr + 24);
-    decode_ascii(hdr + 16, IMAGE_GIT_SHA_LEN, tmp.git_sha, sizeof tmp.git_sha);
-    decode_ascii(hdr + 28, IMAGE_BOARD_NAME_LEN, tmp.board_name, sizeof tmp.board_name);
-
-    if (tmp.magic != IMAGE_MAGIC) {
-        fail(err, err_len, "not an A510 image: magic 0x%04x, expected 0x%04x",
-             (unsigned)tmp.magic, (unsigned)IMAGE_MAGIC);
-        goto done;
-    }
-    if (tmp.version != IMAGE_VERSION_CURRENT) {
-        fail(err, err_len,
-             "unsupported image header version %u, expected %u (version 1 has no board "
-             "fields and is rejected by this tool)", (unsigned)tmp.version,
-             (unsigned)IMAGE_VERSION_CURRENT);
-        goto done;
-    }
-    canonical = image_board_name(tmp.board_id);
+    canonical = image_board_name(tmp->board_id);
     if (canonical == NULL) {
-        fail(err, err_len,
-             "board_id %" PRIu32 " is not a known board (1=D1_EVB, 2=D1_C2, 3=D2_EVB, 4=D2_OAM)",
-             tmp.board_id);
-        goto done;
+        return fail(err, err_len,
+                    "board_id %" PRIu32 " is not a known board (1=D1_EVB, 2=D1_C2, 3=D2_EVB, "
+                    "4=D2_OAM)", tmp->board_id);
     }
-    if (strcmp(tmp.board_name, canonical) != 0) {
-        fail(err, err_len, "board_name '%s' does not describe board_id %" PRIu32 " (%s)",
-             tmp.board_name, tmp.board_id, canonical);
-        goto done;
+    if (strcmp(tmp->board_name, canonical) != 0) {
+        return fail(err, err_len, "board_name '%s' does not describe board_id %" PRIu32 " (%s)",
+                    tmp->board_name, tmp->board_id, canonical);
     }
-
-    payload = tmp.file_size - IMAGE_HEADER_SIZE;
-    if (tmp.image_size != payload) {
-        fail(err, err_len,
-             "image_size %" PRIu32 " does not match the %" PRIu64 " payload bytes "
-             "(truncated or padded image)", tmp.image_size, payload);
-        goto done;
+    if (tmp->image_size != size - IMAGE_HEADER_SIZE) {
+        return fail(err, err_len, "image_size %" PRIu32 " does not match the %" PRIu64
+                    " payload bytes (truncated or padded image)", tmp->image_size,
+                    size - IMAGE_HEADER_SIZE);
     }
-    if (tmp.image_size < IMAGE_MIN_SIZE) {
-        fail(err, err_len,
-             "image_size %" PRIu32 " is too small to hold a vector table (minimum %u bytes)",
-             tmp.image_size, (unsigned)IMAGE_MIN_SIZE);
-        goto done;
+    if (tmp->image_size < IMAGE_MIN_SIZE) {
+        return fail(err, err_len, "image_size %" PRIu32 " is too small to hold a vector table",
+                    tmp->image_size);
     }
-    if (tmp.image_size > region->size) {
-        fail(err, err_len,
-             "the image is %" PRIu32 " bytes, more than the %s region holds (%u bytes from "
-             "0x%08x)", tmp.image_size, region->name,
-             (unsigned)region->size, (unsigned)region->base);
-        goto done;
+    if (size > IMAGE_SLOT_SIZE) {
+        return fail(err, err_len, "the image is %" PRIu64 " bytes, more than a slot holds (%u)",
+                    size, (unsigned)IMAGE_SLOT_SIZE);
     }
-
-    crc = 0;
-    {
-        uint8_t buf[64 * 1024];
-        size_t n;
-
-        while ((n = fread(buf, 1, sizeof buf, fp)) > 0)
-            crc = crc32_update(crc, buf, n);
-        if (ferror(fp)) {
-            fail(err, err_len, "cannot read '%s': %s", path, strerror(errno));
-            goto done;
-        }
+    /* Every image is linked for slot A; the host relocates it for slot B. */
+    if (tmp->vector_addr != IMAGE_SLOT_A_BASE + IMAGE_VECTOR_OFFSET) {
+        return fail(err, err_len, "vector_addr 0x%08x, expected 0x%08x: images must be linked for "
+                    "slot A (0x%08x)", (unsigned)tmp->vector_addr,
+                    (unsigned)(IMAGE_SLOT_A_BASE + IMAGE_VECTOR_OFFSET),
+                    (unsigned)IMAGE_SLOT_A_BASE);
     }
-    if (crc != tmp.crc32) {
-        fail(err, err_len, "CRC32 mismatch: header 0x%08x, computed 0x%08x", tmp.crc32, crc);
-        goto done;
-    }
-
-    /*
-     * Both images carry a vector table at their slot base + 0x200, so the
-     * address tells us which slot the file was linked for. The MCU refuses a
-     * file linked for the other slot; catching it here keeps the board untouched.
-     */
-    if (!addr_in(region, tmp.vector_addr)) {
-        if (addr_in(other, tmp.vector_addr)) {
-            fail(err, err_len,
-                 "this is a %s image (vector table at 0x%08x), not the %s image expected in "
-                 "this position", other->name, (unsigned)tmp.vector_addr, region->name);
-        } else {
-            fail(err, err_len,
-                 "vector_addr 0x%08x is in neither slot A [0x%08x,0x%08x) nor slot B "
-                 "[0x%08x,0x%08x): not an A/B image (pre-0x0300 firmware layout?)",
-                 (unsigned)tmp.vector_addr, (unsigned)SLOT_A_BASE,
-                 (unsigned)(SLOT_A_BASE + SLOT_IMAGE_SIZE), (unsigned)SLOT_B_BASE,
-                 (unsigned)(SLOT_B_BASE + SLOT_IMAGE_SIZE));
-        }
-        goto done;
-    }
-    if (tmp.vector_addr != region->base + IMAGE_VECTOR_OFFSET) {
-        fail(err, err_len,
-             "vector_addr 0x%08x is not the expected 0x%08x for the %s image (the vector "
-             "table is 512-byte aligned at the window base + 0x%x)",
-             (unsigned)tmp.vector_addr, (unsigned)(region->base + IMAGE_VECTOR_OFFSET),
-             region->name, (unsigned)IMAGE_VECTOR_OFFSET);
-        goto done;
-    }
-
-    vector_off = tmp.vector_addr - region->base;
-    if ((uint64_t)vector_off + sizeof vec > tmp.file_size) {
-        fail(err, err_len, "vector table at 0x%08x is outside the image (%" PRIu64 " bytes)",
-             (unsigned)tmp.vector_addr, tmp.file_size);
-        goto done;
-    }
-    if (fseeko(fp, (off_t)vector_off, SEEK_SET) != 0 ||
-        fread(vec, 1, sizeof vec, fp) != sizeof vec) {
-        fail(err, err_len, "cannot read the vector table at offset 0x%x: %s", vector_off,
-             strerror(errno));
-        goto done;
+    if ((uint64_t)IMAGE_VECTOR_OFFSET + 8 > size) {
+        return fail(err, err_len, "vector table at 0x%08x is outside the image",
+                    (unsigned)tmp->vector_addr);
     }
     sp = rd32(vec);
     pc = rd32(vec + 4);
-
     if (sp < SRAM_BASE || sp > SRAM_END || (sp & 3u) != 0) {
-        fail(err, err_len,
-             "initial stack pointer 0x%08x is outside SRAM [0x%08x,0x%08x] or unaligned",
-             sp, (unsigned)SRAM_BASE, (unsigned)SRAM_END);
-        goto done;
+        return fail(err, err_len, "initial stack pointer 0x%08x is outside SRAM [0x%08x,0x%08x] "
+                    "or unaligned", sp, (unsigned)SRAM_BASE, (unsigned)SRAM_END);
     }
     if ((pc & 1u) == 0) {
-        fail(err, err_len, "reset vector 0x%08x has no Thumb bit set", pc);
-        goto done;
+        return fail(err, err_len, "reset vector 0x%08x has no Thumb bit set", pc);
     }
-    if ((pc & ~1u) < region->base || (pc & ~1u) >= region->base + tmp.file_size) {
-        fail(err, err_len, "reset vector 0x%08x is outside the image (0x%08x..0x%08x)", pc,
-             (unsigned)region->base, (unsigned)(region->base + tmp.file_size));
-        goto done;
+    if ((pc & ~1u) < IMAGE_SLOT_A_BASE || (pc & ~1u) >= IMAGE_SLOT_A_BASE + size) {
+        return fail(err, err_len, "reset vector 0x%08x is outside the image", pc);
     }
+    return true;
+}
 
-    *info = tmp;
-    ok = true;
+/* Table entries must be aligned words inside the payload, holding slot A
+ * addresses. Checked on the slot A copy so relocation can rely on it. */
+static bool check_table(const uint8_t *buf, uint64_t start, uint32_t count,
+                        char *err, size_t err_len)
+{
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t off = rd32(buf + start + 4u * i);
+        uint32_t value;
 
-done:
+        /* 12 is the header's vector_addr; CRC and size (4..11) are never addresses. */
+        if ((off & 3u) != 0 || off < 12 || off > start - 4) {
+            return fail(err, err_len, "slot relocation entry %" PRIu32 " has a bad offset 0x%x",
+                        i, off);
+        }
+        value = rd32(buf + off);
+        if (value < IMAGE_SLOT_A_BASE || value >= SLOT_END) {
+            return fail(err, err_len,
+                        "slot relocation entry %" PRIu32 " (offset 0x%x) holds 0x%08x, not a "
+                        "slot A address; the image was not built by the current build.py", i, off,
+                        value);
+        }
+    }
+    return true;
+}
+
+bool image_check_file(const char *path, image_info_t *info, char *err, size_t err_len)
+{
+    image_info_t tmp;
+    struct stat st;
+    static uint8_t buf[IMAGE_SLOT_SIZE];
+    uint64_t table_start;
+    uint32_t crc;
+    FILE *fp;
+    bool ok;
+
+    memset(&tmp, 0, sizeof tmp);
+    if (stat(path, &st) != 0) {
+        return fail(err, err_len, "cannot stat '%s': %s", path, strerror(errno));
+    }
+    if (!S_ISREG(st.st_mode)) {
+        return fail(err, err_len, "'%s' is not a regular file", path);
+    }
+    tmp.file_size = (uint64_t)st.st_size;
+    if (tmp.file_size > sizeof buf) {
+        return fail(err, err_len, "'%s' is %" PRIu64 " bytes, more than a slot holds (%u)",
+                    path, tmp.file_size, (unsigned)IMAGE_SLOT_SIZE);
+    }
+    fp = fopen(path, "rb");
+    if (fp == NULL) {
+        return fail(err, err_len, "cannot open '%s': %s", path, strerror(errno));
+    }
+    ok = fread(buf, 1, (size_t)tmp.file_size, fp) == (size_t)tmp.file_size;
     fclose(fp);
+    if (!ok) {
+        return fail(err, err_len, "cannot read '%s': %s", path, strerror(errno));
+    }
+
+    ok = check_format(buf, tmp.file_size, buf + IMAGE_VECTOR_OFFSET, &tmp, err, err_len);
+    if (ok) {
+        crc = crc32_update(0, buf + IMAGE_HEADER_SIZE, tmp.image_size);
+        if (crc != tmp.crc32) {
+            ok = fail(err, err_len, "CRC32 mismatch: header 0x%08x, computed 0x%08x", tmp.crc32,
+                      crc);
+        }
+    }
+    if (ok) {
+        table_start = reloc_table_start(buf, tmp.file_size, &tmp.reloc_count, err, err_len);
+        ok = table_start != 0 &&
+             check_table(buf, table_start, tmp.reloc_count, err, err_len);
+    }
+    if (ok) {
+        *info = tmp;
+    }
     return ok;
+}
+
+bool image_relocate(const image_info_t *info, const uint8_t *in, uint8_t *out,
+                    char *err, size_t err_len)
+{
+    uint64_t start = info->file_size - 8 - (uint64_t)info->reloc_count * 4u;
+    uint32_t crc;
+
+    memcpy(out, in, (size_t)info->file_size);
+    for (uint32_t i = 0; i < info->reloc_count; i++) {
+        uint32_t off = rd32(out + start + 4u * i);
+        uint32_t value = rd32(out + off);
+
+        /* image_check_file verified the slot A address; re-check in case of a bug. */
+        if (value < IMAGE_SLOT_A_BASE || value >= SLOT_END) {
+            return fail(err, err_len, "relocation entry %" PRIu32 " (offset 0x%x) holds "
+                        "0x%08x, not a slot A address", i, off, value);
+        }
+        wr32(out + off, value + (IMAGE_SLOT_B_BASE - IMAGE_SLOT_A_BASE));
+    }
+    crc = crc32_update(0, out + IMAGE_HEADER_SIZE, info->image_size);
+    wr32(out + 4, crc);
+    return true;
 }
 
 void image_print_summary(const char *label, const char *path, const image_info_t *info)
 {
-    printf("  %-9s %s: OK (%" PRIu64 " bytes, image_size=%" PRIu32 ", crc32=0x%08x, "
-           "board=%s/%" PRIu32 ", vectors=0x%08x, git_sha=%s)\n",
+    printf("  %-5s %s: OK (%" PRIu64 " bytes, image_size=%" PRIu32 ", crc32=0x%08x, "
+           "board=%s/%" PRIu32 ", vectors=0x%08x, %" PRIu32 " slot relocations, git_sha=%s)\n",
            label, path, info->file_size, info->image_size, info->crc32, info->board_name,
-           info->board_id, info->vector_addr, info->git_sha);
+           info->board_id, info->vector_addr, info->reloc_count, info->git_sha);
 }

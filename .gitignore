@@ -13,3 +13,4 @@ compile_commands.json
 fwu_stress_results/
 fwu_fault_results/
 __pycache__/
+relocate

@@ -11,7 +11,7 @@ a valid image: with the A/B protocol only the inactive slot is half written, so
 the MCU must stay in the APP on the same slot, with no PCIe error, and a plain
 re-run must finish the update.
 
-    tests/fwu_faults.py <slot_a.bin> <slot_b.bin> [results_dir]
+    tests/fwu_faults.py <app.bin> [results_dir]
 
 Env:
     BACKEND=smbus|ch347   backend to build/run (default smbus)
@@ -82,15 +82,15 @@ def aer_count():
         return None
 
 
-def fwu(tool, slot_a, slot_b, timeout=180):
+def fwu(tool, image, timeout=180):
     t0 = time.time()
-    r = sh(["timeout", str(timeout), tool, slot_a, slot_b], cwd=ROOT)
+    r = sh(["timeout", str(timeout), tool, image], cwd=ROOT)
     return r.returncode, time.time() - t0, r.stdout + r.stderr
 
 
-def kill_at_percent(tool, slot_a, slot_b, pct):
+def kill_at_percent(tool, image, pct):
     """Run an update and SIGKILL the tool once the write phase reaches pct%."""
-    p = subprocess.Popen([tool, slot_a, slot_b], cwd=ROOT, bufsize=0,
+    p = subprocess.Popen([tool, image], cwd=ROOT, bufsize=0,
                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     in_app_phase = False
     buf = b""
@@ -115,18 +115,18 @@ def kill_at_percent(tool, slot_a, slot_b, pct):
     return killed
 
 
-def recover(tool, status_exe, slot_a, slot_b):
-    rc, dur, out = fwu(tool, slot_a, slot_b)
+def recover(tool, status_exe, image):
+    rc, dur, out = fwu(tool, image)
     st = mcu_status(status_exe)
     ok = rc == 0 and st.get("app") == "1"
     return ok, rc, dur, st, out
 
 
 def main():
-    if len(sys.argv) < 3:
+    if len(sys.argv) < 2:
         sys.exit(__doc__)
-    slot_a, slot_b = sys.argv[1], sys.argv[2]
-    results = sys.argv[3] if len(sys.argv) > 3 else "fwu_fault_results"
+    image = sys.argv[1]
+    results = sys.argv[2] if len(sys.argv) > 2 else "fwu_fault_results"
     os.makedirs(results, exist_ok=True)
     tool, status_exe = build()
 
@@ -139,7 +139,7 @@ def main():
         return r.returncode
 
     # prepared bad images
-    data = open(os.path.join(ROOT, slot_a), "rb").read()
+    data = open(os.path.join(ROOT, image), "rb").read()
     trunc = os.path.join(results, "app_truncated.bin")
     open(trunc, "wb").write(data[: len(data) // 2])
     bad = bytearray(data)
@@ -148,18 +148,17 @@ def main():
     open(badcrc, "wb").write(bytes(bad))
 
     cases = [
-        ("kill@10%", lambda: kill_at_percent(tool, slot_a, slot_b, 10), "MCU stays in APP on the same slot"),
-        ("kill@50%", lambda: kill_at_percent(tool, slot_a, slot_b, 50), "MCU stays in APP on the same slot"),
-        ("kill@90%", lambda: kill_at_percent(tool, slot_a, slot_b, 90), "MCU stays in APP on the same slot"),
-        ("truncated slot A", lambda: must_refuse("truncated slot A", [trunc, slot_b]),
+        ("kill@10%", lambda: kill_at_percent(tool, image, 10), "MCU stays in APP on the same slot"),
+        ("kill@50%", lambda: kill_at_percent(tool, image, 50), "MCU stays in APP on the same slot"),
+        ("kill@90%", lambda: kill_at_percent(tool, image, 90), "MCU stays in APP on the same slot"),
+        ("truncated image", lambda: must_refuse("truncated image", [trunc]),
          "host pre-check refuses, board untouched"),
-        ("corrupt slot A payload", lambda: must_refuse("corrupt slot A payload", [badcrc, slot_b]),
-         "host pre-check refuses, board untouched"),
-        ("swapped slots", lambda: must_refuse("swapped slots", [slot_b, slot_a]),
+        ("corrupt payload", lambda: must_refuse("corrupt payload", [badcrc]),
          "host pre-check refuses, board untouched"),
         ("no args", lambda: sh([tool], cwd=ROOT).returncode, "usage error, board untouched"),
-        ("one arg", lambda: sh([tool, slot_a], cwd=ROOT).returncode, "usage error, board untouched"),
-        ("wrong bus", lambda: sh(["env", "A510_I2C_BUS=5", tool, slot_a, slot_b], cwd=ROOT).returncode,
+        ("two args", lambda: sh([tool, image, image], cwd=ROOT).returncode,
+         "usage error, board untouched"),
+        ("wrong bus", lambda: sh(["env", "A510_I2C_BUS=5", tool, image], cwd=ROOT).returncode,
          "init fails, board untouched"),
     ]
 
@@ -174,11 +173,11 @@ def main():
         with open(log, "w") as f:
             f.write("before=%s\nafter_fault=%s\naction_result=%s\n" % (before, after_fault, out))
 
-        ok, rc, dur, st, rec_out = recover(tool, status_exe, slot_a, slot_b)
+        ok, rc, dur, st, rec_out = recover(tool, status_exe, image)
         aer1 = aer_count()
         note = ""
         # The fault itself must never take the board away: same slot, still APP.
-        if after_fault.get("slot_a") != "1" or after_fault.get("running_slot") != before.get("running_slot"):
+        if after_fault.get("app") != "1" or after_fault.get("running_slot") != before.get("running_slot"):
             ok = False
             note = "fault disturbed the running firmware"
         if aer0 is not None and aer1 is not None and aer1 > aer0:
@@ -187,10 +186,10 @@ def main():
         rows.append({
             "case": name, "expected": expect,
             "state_after_fault": after_fault.get("boot_state", "?"),
-            "app_after_fault": after_fault.get("slot_a", "?"),
+            "app_after_fault": after_fault.get("app", "?"),
             "board_id_after_fault": after_fault.get("board_id", "?"),
             "recovery_rc": rc, "recovery_s": "%.1f" % dur,
-            "recovery_app": st.get("slot_a", "?"), "recovery_hash": st.get("git_hash", "?"),
+            "recovery_app": st.get("app", "?"), "recovery_hash": st.get("git_hash", "?"),
             "recovery_board_id": st.get("board_id", "?"),
             "result": "RECOVERED" if ok else "BRICKED",
             "note": note,

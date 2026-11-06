@@ -2,7 +2,7 @@
 #
 # A510 MCU FWU stress harness.
 #
-#   tests/fwu_stress.sh <iterations> <slot_a.bin> <slot_b.bin> [results_dir] [resume_from]
+#   tests/fwu_stress.sh <iterations> <app.bin> [results_dir] [resume_from]
 #
 # Each iteration runs one full A/B FWU (REQUEST -> write the inactive slot ->
 # ACTIVATE) and records the outcome plus host health around it. The update is
@@ -24,11 +24,10 @@
 # Exit: 0 all iterations PASS, 1 at least one FAIL, 2 harness error.
 set -u
 
-ITERATIONS=${1:?usage: fwu_stress.sh <iterations> <slot_a.bin> <slot_b.bin> [results_dir] [resume_from]}
-SLOT_A=${2:?usage: fwu_stress.sh <iterations> <slot_a.bin> <slot_b.bin> [results_dir] [resume_from]}
-SLOT_B=${3:?usage: fwu_stress.sh <iterations> <slot_a.bin> <slot_b.bin> [results_dir] [resume_from]}
-RESULTS=${4:-fwu_stress_results}
-RESUME=${5:-0}
+ITERATIONS=${1:?usage: fwu_stress.sh <iterations> <app.bin> [results_dir] [resume_from]}
+IMAGE=${2:?usage: fwu_stress.sh <iterations> <app.bin> [results_dir] [resume_from]}
+RESULTS=${3:-fwu_stress_results}
+RESUME=${4:-0}
 
 BACKEND=${BACKEND:-smbus}
 BDF=${A510_BDF:-}
@@ -79,7 +78,7 @@ for i in $(seq "$start_iter" "$end_iter"); do
     pre_ok=$?
 
     t0=$(date +%s.%N)
-    timeout "$MAX_SECONDS" ./fwu_host_demo "$SLOT_A" "$SLOT_B" > "$log" 2>&1
+    timeout "$MAX_SECONDS" ./fwu_host_demo "$IMAGE" > "$log" 2>&1
     rc=$?
     t1=$(date +%s.%N)
     duration=$(awk "BEGIN{printf \"%.1f\", $t1-$t0}")
