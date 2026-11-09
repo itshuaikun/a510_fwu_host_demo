@@ -260,6 +260,8 @@ int main(int argc, char **argv)
     printf("done\n     writing... ");
     send_buffer(data, (size_t)image.file_size, chunk, target ? "relocated image" : argv[1]);
 
+    /* The last COMMIT is still programming: the MCU does not answer meanwhile. */
+    wait_status(FWU_STATUS_FIFO_NOT_EMPTY | FWU_STATUS_BUSY, DRAIN_TIMEOUT_MS, "last chunk");
     send_fwu_cmd(FWU_CMD_FILE_SEND_DONE);
     uint8_t status = wait_status(FWU_STATUS_FIFO_NOT_EMPTY | FWU_STATUS_BUSY,
                                  VERIFY_TIMEOUT_MS, "verify");
